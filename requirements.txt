@@ -1,0 +1,48 @@
+# ═══════════════════════════════════════════════════════════
+# Gmail-infinity — Dependencies
+# ═══════════════════════════════════════════════════════════
+# Install:  pip install -r requirements.txt
+# Then:     playwright install chromium
+# ═══════════════════════════════════════════════════════════
+
+# ─── Core: Playwright (Primary Engine) ───
+# Patchright is a drop-in patched Playwright: removes the Runtime.enable /
+# Console.enable CDP leaks that every major anti-bot fingerprints. core/pw.py
+# prefers it and falls back to vanilla playwright if absent.
+patchright>=1.61.0
+playwright>=1.40.0
+playwright-stealth>=1.0.6
+
+# ─── Core: Selenium (Legacy Engine) ───
+selenium>=4.15.0
+webdriver-manager>=4.0.0
+
+# ─── Mobile: Appium (Android / Golden Method) ───
+Appium-Python-Client>=3.1.0
+
+# ─── HTTP & Async ───
+requests>=2.31.0
+aiohttp>=3.9.0
+
+# ─── Environment & Config ───
+python-dotenv>=1.0.0
+
+# ─── Terminal UI ───
+rich>=13.7.0
+
+# ─── Data & Names ───
+numpy>=1.26.0
+
+# ─── Encryption: SecureVault (Fernet at-rest for stored credentials) ───
+cryptography>=42.0.0
+
+# ─── System metrics for the live status panel ───
+psutil>=5.9.0
+
+# ─── SOCKS5 proxy support (requested via socks5:// URLs in proxies.txt) ───
+PySocks>=1.7.1
+
+# ─── Voice OTP Server (services/voice.py, optional) ───
+flask>=3.0.0
+pydub>=0.25.1
+waitress>=3.0.0

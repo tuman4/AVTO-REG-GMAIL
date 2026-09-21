@@ -1,0 +1,61 @@
+# ─── Secrets & environment ───
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+config/5sim_config.txt
+config/password.txt
+config/proxies.txt
+
+# ─── Runtime data (contains encrypted credentials, keys, logs) ───
+data/*
+!data/names.txt
+!data/README.txt
+credentials/
+
+# ─── Python ───
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+venv/
+env/
+.venv/
+*.egg-info/
+*.egg
+
+# ─── Build & dependencies ───
+build/
+dist/
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ─── Playwright / browser artefacts ───
+downloads/
+debug_*.png
+temp_audio/
+
+# ─── Logs ───
+*.log
+
+# ─── Temporary ───
+*.tmp
+*.temp
+.cache/
+
+# ─── IDE ───
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+*.swp
+*.swo
+
+# ─── OS ───
+.DS_Store
+Thumbs.db
+desktop.ini
