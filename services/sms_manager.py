@@ -8,6 +8,7 @@ Provides a single interface for all SMS services:
 """
 import asyncio
 import re
+import time
 import logging
 import aiohttp
 from config.settings import Config
@@ -185,7 +186,114 @@ def format_phone_for_google(phone: str) -> str:
     return f"+{digits}"
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
+# 5sim operator auto-selection
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Public price feed — no token needed. 5sim's getNumbersStatus reports raw
+# stock per operator; this one also carries real 24h delivery rates, which is
+# what separates "cheap" from "cheap and actually delivers".
+_5SIM_PRICES_URL = "https://5sim.net/v1/guest/prices?product=google"
+
+# Cached choice: prices barely move inside a single batch run, but the API is
+# a round trip we don't want on every account.
+_selection = {"expires": 0.0, "country": None, "operator": None}
+_SELECTION_TTL = 3600  # one hour
+
+
+def _cost_per_success(cost: float, rate: float) -> float:
+    """Effective price per delivered code. Providers charge per attempt, so a
+    $0.08 number that lands 3% of the time costs more than a $0.20 at 60%."""
+    return cost / (rate / 100.0) if rate > 0 else float("inf")
+
+
+async def _fetch_5sim_prices(country: str) -> dict:
+    """Return {operator: {cost, rate24}} for google numbers in `country`."""
+    async with aiohttp.ClientSession() as session:
+        async with session.get(_5SIM_PRICES_URL, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            if resp.status != 200:
+                logger.warning(f"5sim price feed returned {resp.status}")
+                return {}
+            data = await resp.json()
+
+    # Shape is product-first: {"google": {"<country>": {"<operator>": {...}}}}
+    product = data.get("google", {})
+    return product.get(country, {})
+
+
+async def _select_5sim_operator(country: str, max_price: float) -> tuple:
+    """Pick the operator with the best cost-per-successful-delivery.
+
+    Returns (operator, cost) or (None, None) when the feed is unreachable or
+    no operator meets the price floor — the caller falls back to the env value.
+    """
+    try:
+        offers = await _fetch_5sim_prices(country)
+    except Exception as e:
+        logger.warning(f"5sim price feed unreachable: {e}")
+        return None, None
+
+    if not offers:
+        logger.warning(f"5sim price feed has no google offers for '{country}'")
+        return None, None
+
+    best_op, best_cps, best_cost = None, float("inf"), None
+    for operator, offer in offers.items():
+        if not isinstance(offer, dict):
+            continue
+        cost = offer.get("cost")
+        count = offer.get("count", 0)
+        if cost is None or not count:
+            continue
+        rate = offer.get("rate24") or offer.get("rate") or 0
+        if cost > max_price:
+            continue
+        cps = _cost_per_success(cost, rate)
+        if cps < best_cps:
+            best_op, best_cps, best_cost = operator, cps, cost
+
+    if not best_op:
+        logger.warning(
+            f"No 5sim operator under ${max_price:.2f} for '{country}' "
+            f"({len(offers)} offers, all above price floor)"
+        )
+        return None, None
+
+    rate = offers[best_op].get("rate24") or offers[best_op].get("rate") or 0
+    logger.info(
+        f"5sim auto-pick for '{country}': {best_op} @ ${best_cost:.4f} "
+        f"(24h delivery {rate:.2f}%, cost/success ${best_cps:.4f})"
+    )
+    return best_op, best_cost
+
+
+async def _resolve_5sim_operator() -> str:
+    """The operator to buy from: auto-selected, or the env default."""
+    country = getattr(Config, 'FIVESIM_COUNTRY', 'usa')
+    configured = getattr(Config, 'FIVESIM_OPERATOR', 'any')
+    enabled = getattr(Config, 'FIVESIM_AUTO_OPERATOR', True)
+
+    if not enabled or configured != "any":
+        return configured
+
+    now = time.time()
+    if _selection["operator"] and now < _selection["expires"] and _selection["country"] == country:
+        return _selection["operator"]
+
+    max_price = getattr(Config, 'FIVESIM_MAX_PRICE', 0.50)
+    operator, _ = await _select_5sim_operator(country, max_price)
+    if not operator:
+        return configured
+
+    _selection.update(
+        expires=now + _SELECTION_TTL,
+        country=country,
+        operator=operator,
+    )
+    return operator
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # 5sim implementation
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -212,7 +320,7 @@ async def _get_5sim_phone():
         return None
 
     country = getattr(Config, 'FIVESIM_COUNTRY', 'usa')
-    operator = getattr(Config, 'FIVESIM_OPERATOR', 'any')
+    operator = await _resolve_5sim_operator()
     url = f"https://5sim.net/v1/user/buy/activation/{country}/{operator}/google"
 
     async with aiohttp.ClientSession() as session:

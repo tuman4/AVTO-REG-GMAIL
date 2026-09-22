@@ -4,6 +4,7 @@ UI Module - Terminal interface with Rich for Gmail Creator Pro
 import os
 import sys
 import re
+import time
 import datetime
 from rich.console import Console
 from rich.panel import Panel
@@ -234,14 +235,26 @@ def _show_services_status():
     table = Table(title="Services Status", border_style=THEME["primary"])
     table.add_column("Service", style=THEME["primary"])
     table.add_column("Status", style=THEME["success"])
+    table.add_column("Detail", style=THEME["muted"], overflow="fold")
 
-    table.add_row("5sim SMS", f"[{THEME['success']}]Active[/]" if Config.FIVESIM_API_KEY else f"[{THEME['error']}]Not Set[/]")
-    table.add_row("SMS-Activate", f"[{THEME['success']}]Active[/]" if Config.SMS_ACTIVATE_API_KEY else f"[{THEME['error']}]Not Set[/]")
-    table.add_row("OnlineSIM", f"[{THEME['success']}]Active[/]" if Config.ONLINESIM_API_KEY else f"[{THEME['error']}]Not Set[/]")
-    table.add_row("GetSMS", f"[{THEME['success']}]Active[/]" if Config.GETSMS_API_KEY else f"[{THEME['error']}]Not Set[/]")
-    table.add_row("2Captcha", f"[{THEME['success']}]Active[/]" if Config.TWOCAPTCHA_API_KEY else f"[{THEME['error']}]Not Set[/]")
-    table.add_row("Anti-Captcha", f"[{THEME['success']}]Active[/]" if Config.ANTICAPTCHA_API_KEY else f"[{THEME['error']}]Not Set[/]")
-    table.add_row("CapMonster", f"[{THEME['success']}]Active[/]" if Config.CAPMONSTER_API_KEY else f"[{THEME['error']}]Not Set[/]")
+    from services.sms_manager import _selection
+    import asyncio as _asyncio
+
+    pick = "auto"
+    try:
+        _asyncio.get_running_loop()
+    except RuntimeError:
+        if _selection["operator"] and _selection["expires"] > time.time():
+            pick = _selection["operator"]
+    table.add_row("5sim SMS",
+                  f"[{THEME['success']}]Active[/]" if Config.FIVESIM_API_KEY else f"[{THEME['error']}]Not Set[/]",
+                  f"operator: {pick}")
+    table.add_row("SMS-Activate", f"[{THEME['success']}]Active[/]" if Config.SMS_ACTIVATE_API_KEY else f"[{THEME['error']}]Not Set[/]", "")
+    table.add_row("OnlineSIM", f"[{THEME['success']}]Active[/]" if Config.ONLINESIM_API_KEY else f"[{THEME['error']}]Not Set[/]", "")
+    table.add_row("GetSMS", f"[{THEME['success']}]Active[/]" if Config.GETSMS_API_KEY else f"[{THEME['error']}]Not Set[/]", "")
+    table.add_row("2Captcha", f"[{THEME['success']}]Active[/]" if Config.TWOCAPTCHA_API_KEY else f"[{THEME['error']}]Not Set[/]", "")
+    table.add_row("Anti-Captcha", f"[{THEME['success']}]Active[/]" if Config.ANTICAPTCHA_API_KEY else f"[{THEME['error']}]Not Set[/]", "")
+    table.add_row("CapMonster", f"[{THEME['success']}]Active[/]" if Config.CAPMONSTER_API_KEY else f"[{THEME['error']}]Not Set[/]", "")
     console.print(table)
 
 

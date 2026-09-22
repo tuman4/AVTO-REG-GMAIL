@@ -40,8 +40,13 @@ class Config:
     # 5sim uses country names ("usa"); SMS-Activate/OnlineSIM use numeric
     # codes (US = 187 / 1). Russia (0/7) is mass-banned by Google — avoid.
     FIVESIM_API_KEY = os.getenv("FIVESIM_API_KEY", "")
-    FIVESIM_COUNTRY = os.getenv("FIVESIM_COUNTRY", "usa")
+    FIVESIM_COUNTRY = os.getenv("FIVESIM_COUNTRY", "canada")
     FIVESIM_OPERATOR = os.getenv("FIVESIM_OPERATOR", "any")
+    # "any" (default) = pick the operator with the best cost-per-delivered-code
+    # from 5sim's public price feed (needs no key). A specific operator pins it.
+    FIVESIM_AUTO_OPERATOR = _flag("FIVESIM_AUTO_OPERATOR", "True")
+    # Ceiling on what auto-selection may spend; operators above this are ignored.
+    FIVESIM_MAX_PRICE = float(os.getenv("FIVESIM_MAX_PRICE", "0.50") or 0.50)
 
     SMS_ACTIVATE_API_KEY = os.getenv("SMS_ACTIVATE_API_KEY", "")
     SMS_ACTIVATE_COUNTRY = os.getenv("SMS_ACTIVATE_COUNTRY", "187")
