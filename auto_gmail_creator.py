@@ -471,7 +471,8 @@ def main():
     except KeyboardInterrupt:
         console.print(f"\n[{THEME['warning']}]Process interrupted by user.[/]")
     except Exception as e:
-        console.print(f"\n[{THEME['error']}]Fatal error: {e}[/]")
+        console.print(f"\n[{THEME['error']}]Fatal error:[/]")
+        console.print(f"[{THEME['error']}]{e!r}[/]")
 
     console.print(f"\n[{THEME['primary']}]{'='*74}[/]")
     console.print(f"[bold bright_white]  SHADOW GENESIS[/] [{THEME['secondary']}]v{THEME['version']}[/] [{THEME['primary']}]|[/] [dim]Developed by[/] [bold bright_white]Shadow Hacker[/]")

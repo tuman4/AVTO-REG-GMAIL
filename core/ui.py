@@ -50,12 +50,7 @@ def clear_screen():
 
 def show_banner():
     clear_screen()
-    status = _get_system_status()  # noqa: F841 — interpolated by rich in the banner
-    c = THEME["primary"]           # noqa: F841
-    m = THEME["secondary"]         # noqa: F841
-    g = THEME["success"]           # noqa: F841
-    w = THEME["warning"]           # noqa: F841
-    d = "dim"                      # noqa: F841
+    status = _get_system_status()
 
     banner = """
 [{c}]    ::::::::  :::    :::     :::     :::::::::   ::::::::  :::       :::
@@ -75,7 +70,7 @@ def show_banner():
      ########  ########## ###    #### ########## ########  ########### ########[/]
 
 [{c}]  ============================================================================================[/]
-[{c}]  ||[/]  [{g}]SYSTEM[/] [bold {g}]ONLINE[/]  [{d}]|[/]  [{d}]PING[/] [{c}]{status['latency']}[/]  [{d}]|[/]  [{d}]MEM[/] [{m}]{status['memory']}[/]  [{d}]|[/]  [{d}]TIME[/] [{c}]{status['time']}[/]  [{d}]|[/]  [{w}]v{THEME['version']}[/]  [{c}]||[/]
+[{c}]  ||[/]  [{g}]SYSTEM[/] [bold {g}]ONLINE[/]  [{d}]|[/]  [{d}]PING[/] [{c}]{status[latency]}[/]  [{d}]|[/]  [{d}]MEM[/] [{m}]{status[memory]}[/]  [{d}]|[/]  [{d}]TIME[/] [{c}]{status[time]}[/]  [{d}]|[/]  [{w}]v{version}[/]  [{c}]||[/]
 [{c}]  ============================================================================================[/]
 
     [{g}]>>>[/] [bold bright_white]PHANTOM CORE[/] [{m}]|[/] [bold {c}]GMAIL GENESIS ENGINE[/] [{m}]|[/] [{d}]STEALTH - NEURAL - AUTONOMOUS[/]
@@ -87,18 +82,16 @@ def show_banner():
     [{m}]#[/] [bold]FINGERPRINT[/]        [{m}]#[/] [bold]SESSION_WARM[/]       [{m}]#[/] [bold]GHOST_TYPER[/]        [{m}]#[/] [bold]RETRY_ENGINE[/]
       [{d}]Poltergeist v2[/]         [{d}]Trust Build[/]           [{d}]Human Sim[/]            [{d}]Smart Rotate[/]
 [{c}]  ============================================================================================[/]
-    [{d}]Developed by[/] [bold bright_white]Shadow Hacker[/] [{d}]|[/] [{d}]All Rights Reserved[/] [{d}]|[/] [{m}]{status['date']}[/]
+    [{d}]Developed by[/] [bold bright_white]Shadow Hacker[/] [{d}]|[/] [{d}]All Rights Reserved[/] [{d}]|[/] [{m}]{status[date]}[/]
 [{c}]  ============================================================================================[/]
 """
-    console.print(banner)
+    console.print(banner.format(
+        c=THEME["primary"], m=THEME["secondary"], g=THEME["success"],
+        w=THEME["warning"], d="dim", status=status, version=THEME["version"],
+    ))
 
 
 def show_menu(engine_name="PLAYWRIGHT"):
-    c = THEME["primary"]    # noqa: F841 — rich markup placeholders below
-    m = THEME["secondary"]  # noqa: F841
-    g = THEME["success"]    # noqa: F841
-    w = THEME["warning"]    # noqa: F841
-    e = THEME["error"]      # noqa: F841
 
     menu = """
 [{c}]  ============================================================================================[/]
@@ -136,7 +129,10 @@ def show_menu(engine_name="PLAYWRIGHT"):
 
 [{c}]  ============================================================================================[/]
 """
-    console.print(menu)
+    console.print(menu.format(
+        c=THEME["primary"], m=THEME["secondary"], g=THEME["success"],
+        w=THEME["warning"], e=THEME["error"], engine_name=engine_name,
+    ))
 
 
 def get_menu_choice():
