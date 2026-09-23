@@ -9,6 +9,131 @@ import logging
 
 logger = logging.getLogger('gmail_creator_postwarmer')
 
+_WARM_SEARCHES = [
+    "weather this week", "best coffee near me", "how to backup gmail",
+    "google account security check", "free online courses",
+    "what is my ip", "how to recover email password", "news today",
+]
+
+_WARM_SERVICES = [
+    "https://news.google.com/",
+    "https://maps.google.com/",
+    "https://drive.google.com/",
+    "https://translate.google.com/",
+    "https://photos.google.com/",
+    "https://myaccount.google.com/",
+]
+
+
+async def warm_existing_session(page, duration_minutes=5):
+    """
+    Warm the account in the SAME browser context it was registered in.
+
+    After registration the page is already logged in, already has the signup
+    session's cookies, fingerprint and proxy. Opening a second browser to
+    "warm" the account would re-login from a different IP and a different
+    fingerprint — which looks to Google like account theft and triggers the
+    very phone challenge the warmup is meant to prevent.
+
+    This function only works with a page that is already authenticated.
+    """
+    if not page:
+        return False
+
+    logger.info(f"Warming existing session for {duration_minutes} minutes...")
+    end = time.time() + duration_minutes * 60
+
+    async def _dwell(lo, hi):
+        await page.wait_for_timeout(random.randint(lo * 1000, hi * 1000))
+
+    async def _scroll():
+        try:
+            dist = random.randint(200, 700)
+            steps = random.randint(3, 6)
+            for _ in range(steps):
+                await page.mouse.wheel(0, dist // steps)
+                await page.wait_for_timeout(random.randint(120, 320))
+        except Exception:
+            pass
+
+    async def _youtube():
+        # Watch time is the single strongest Google-ecosystem trust signal.
+        try:
+            await page.goto("https://www.youtube.com", timeout=20000,
+                            wait_until="domcontentloaded")
+            await _dwell(2, 4)
+            await _scroll()
+            thumbs = await page.query_selector_all("a#thumbnail")
+            if thumbs and len(thumbs) > 2:
+                await random.choice(thumbs[:8]).click(timeout=4000)
+                await _dwell(25, 60)
+                await _scroll()
+        except Exception as e:
+            logger.debug(f"warmer/youtube: {e}")
+
+    async def _search():
+        try:
+            await page.goto("https://www.google.com", timeout=20000,
+                            wait_until="domcontentloaded")
+            await _dwell(1, 2)
+            box = await page.query_selector("textarea[name='q'], input[name='q']")
+            if not box:
+                return
+            await box.click()
+            query = random.choice(_WARM_SEARCHES)
+            for ch in query:
+                await page.keyboard.type(ch)
+                await page.wait_for_timeout(random.randint(50, 130))
+            await page.keyboard.press("Enter")
+            await _dwell(3, 6)
+            await _scroll()
+            results = await page.query_selector_all("a h3")
+            if results and len(results) > 1:
+                await random.choice(results[:5]).click(timeout=4000)
+                await _dwell(3, 8)
+                await _scroll()
+        except Exception as e:
+            logger.debug(f"warmer/search: {e}")
+
+    async def _gmail():
+        # Reading mail is the most direct "this is a real mailbox" signal.
+        try:
+            await page.goto("https://mail.google.com/mail/", timeout=25000,
+                            wait_until="domcontentloaded")
+            await _dwell(3, 6)
+            await _scroll()
+            rows = await page.query_selector_all("tr.zA, div[role='main'] tr")
+            if rows and len(rows) > 1:
+                await random.choice(rows[:6]).click(timeout=4000)
+                await _dwell(4, 10)
+                await _scroll()
+        except Exception as e:
+            logger.debug(f"warmer/gmail: {e}")
+
+    async def _service():
+        try:
+            url = random.choice(_WARM_SERVICES)
+            await page.goto(url, timeout=20000, wait_until="domcontentloaded")
+            await _dwell(2, 5)
+            await _scroll()
+        except Exception as e:
+            logger.debug(f"warmer/service: {e}")
+
+    # Ordered by trust value, with a little randomness so no two runs look alike.
+    plan = [_gmail, _search, _youtube, _service, _search, _gmail]
+    random.shuffle(plan)
+
+    for activity in plan:
+        if time.time() >= end:
+            break
+        try:
+            await activity()
+        except Exception as e:
+            logger.debug(f"warmer/activity: {e}")
+
+    logger.info("Session warming complete")
+    return True
+
 
 async def warm_account_playwright(email, password, duration_minutes=3):
     """

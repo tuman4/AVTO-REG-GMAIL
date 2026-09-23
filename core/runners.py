@@ -942,10 +942,14 @@ async def async_playwright_flow(i, num_accounts, username, first_name, last_name
         # Post-creation account warming
         try:
             if Config.ENABLE_SESSION_WARMING:
-                from core.account_warmer import warm_account_playwright
+                from core.account_warmer import warm_existing_session
                 _update_progress(progress, account_task, completed=98,
                                 description="Warming new account...")
-                await warm_account_playwright(f"{username}@gmail.com", password, duration_minutes=2)
+                # Warm in the SAME context the account was created in: the page is
+                # already logged in, already has the signup proxy and fingerprint.
+                # A second browser would re-login from a different IP and look
+                # like a hijack, tripping the phone check we are trying to avoid.
+                await warm_existing_session(page, duration_minutes=5)
         except Exception as warm_err:
             logger.debug(f"Account warming (non-fatal): {warm_err}")
 
