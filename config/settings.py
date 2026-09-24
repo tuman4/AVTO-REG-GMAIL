@@ -57,6 +57,19 @@ class Config:
     GETSMS_API_KEY = os.getenv("GETSMS_API_KEY", "")
     GETSMS_COUNTRY = os.getenv("GETSMS_COUNTRY", "us")
 
+    # vak-sms.com — the only provider still accepting RU cards (via Fride.io,
+    # 10% fee) and the only one with a public price feed that includes stock.
+    # Unlike the others there is no API key: it uses email/password login with a
+    # reCAPTCHA v2 token on signin, then a session JWT.
+    VAKSMS_EMAIL = os.getenv("VAKSMS_EMAIL", "")
+    VAKSMS_PASSWORD = os.getenv("VAKSMS_PASSWORD", "")
+    # ISO-3166 alpha-2, lowercase: ca, gb, ph, br... must match the proxy geo.
+    VAKSMS_COUNTRY = os.getenv("VAKSMS_COUNTRY", "ca")
+    # "gl" = google.com on vak-sms (their service codes, not "go").
+    VAKSMS_SERVICE = os.getenv("VAKSMS_SERVICE", "gl")
+    # Ceiling for auto-select; Canada google sits at $0.08, UK at $0.07.
+    VAKSMS_MAX_PRICE = float(os.getenv("VAKSMS_MAX_PRICE", "0.15") or 0.15)
+
     # ── CAPTCHA providers ───────────────────────────────────────────────
     TWOCAPTCHA_API_KEY = os.getenv("TWOCAPTCHA_API_KEY", "")
     ANTICAPTCHA_API_KEY = os.getenv("ANTICAPTCHA_API_KEY", "")
@@ -131,11 +144,17 @@ class Config:
             cls.SMS_ACTIVATE_API_KEY,
             cls.ONLINESIM_API_KEY,
             cls.GETSMS_API_KEY,
+            cls.VAKSMS_EMAIL,
         )
         if not any(sms_keys):
             warnings.append(
                 "No SMS API key configured — only the free phone bypass will "
                 "be attempted. Add a key to .env for SMS verification."
+            )
+        if cls.VAKSMS_EMAIL and not cls.VAKSMS_PASSWORD:
+            warnings.append(
+                "VAKSMS_EMAIL is set but VAKSMS_PASSWORD is empty — the "
+                "vak-sms provider will be skipped."
             )
 
         if cls.ENABLE_PROXY and not cls.PROXY_FILE:

@@ -7,6 +7,8 @@ Provides a single interface for all SMS services:
   - GetSMS
 """
 import asyncio
+import base64
+import json
 import re
 import time
 import logging
@@ -63,9 +65,10 @@ async def get_phone_from_any_service():
     """
     services = [
         ("5sim",         Config.FIVESIM_API_KEY,       _get_5sim_phone),
-        ("sms_activate", Config.SMS_ACTIVATE_API_KEY,   _get_sms_activate_phone),
-        ("onlinesim",    Config.ONLINESIM_API_KEY,      _get_onlinesim_phone),
-        ("getsms",       Config.GETSMS_API_KEY,         _get_getsms_phone),
+        ("sms_activate", Config.SMS_ACTIVATE_API_KEY,  _get_sms_activate_phone),
+        ("onlinesim",    Config.ONLINESIM_API_KEY,     _get_onlinesim_phone),
+        ("getsms",       Config.GETSMS_API_KEY,        _get_getsms_phone),
+        ("vaksms",       Config.VAKSMS_EMAIL,          _get_vaksms_phone),
     ]
 
     for name, api_key, get_fn in services:
@@ -95,6 +98,7 @@ async def get_code_from_service(service_name: str, order_id: str, wait_time: int
         'sms_activate': _poll_sms_activate_code,
         'onlinesim':    _poll_onlinesim_code,
         'getsms':       _poll_getsms_code,
+        'vaksms':       _poll_vaksms_code,
     }.get(service_name)
 
     if not poll_fn:
@@ -112,6 +116,7 @@ async def cancel_order(service_name: str, order_id: str):
             'sms_activate': _cancel_sms_activate_order,
             'onlinesim':    _cancel_onlinesim_order,
             'getsms':       _cancel_getsms_order,
+            'vaksms':       _cancel_vaksms_order,
         }.get(service_name)
 
         if cancel_fn:
@@ -129,6 +134,7 @@ async def finish_order(service_name: str, order_id: str):
             'sms_activate': _finish_sms_activate_order,
             'onlinesim':    None,
             'getsms':       _finish_getsms_order,
+            'vaksms':       _finish_vaksms_order,
         }.get(service_name)
 
         if finish_fn:
@@ -146,6 +152,7 @@ async def check_balance(service_name: str = None):
         'sms_activate': (Config.SMS_ACTIVATE_API_KEY, _get_sms_activate_balance),
         'onlinesim': (getattr(Config, 'ONLINESIM_API_KEY', ''), _get_onlinesim_balance),
         'getsms': (getattr(Config, 'GETSMS_API_KEY', ''), _get_getsms_balance),
+        'vaksms': (Config.VAKSMS_EMAIL, _get_vaksms_balance),
     }
 
     if service_name:
@@ -648,5 +655,305 @@ async def _finish_getsms_order(order_id: str):
     url = "https://api.getsms.io/stubs/handler_api.php"
     params = {"api_key": Config.GETSMS_API_KEY, "action": "setStatus", "id": order_id, "status": 6}
     async with aiohttp.ClientSession() as session:
-        async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+        async with session.post(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
             logger.info(f"GetSMS finish response: {resp.status}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# vak-sms implementation
+# ══════════════════════════════════════════════════════════════════════════════
+# vak-sms has no API key. Signin takes email+password plus a reCAPTCHA v2 token,
+# returns an {accessToken, ...} JWT bundle, and every later call carries
+# Authorization: Bearer <token>. The token is decoded for the refresh path.
+#
+# Endpoints (read from their SPA bundle, not guessed):
+#   POST /auth/signin            {username, password, captcha}
+#   POST /auth/refresh           (cookie/Bearer)  -> new accessToken
+#   GET  /user/current/me                        -> {apiKey, balance, ...}
+#   GET  /country/stats?serviceId=<svc>          -> price tiers per country
+#   POST /number/buy   {countryCode, operatorId, serviceCode, rentTime, price}
+#   GET  /number/active?page=1&count=50          -> active orders incl. smsCode
+#   POST /number/cancel {phoneNumber, isBanned, serviceCode}
+#
+# The buy response is {"tel": "+1..."}. The SPA's order id is the phone itself:
+# /number/active, /number/cancel and /number/ban are all keyed on phoneNumber,
+# not on a purchase id (purchaseId only surfaces in history responses).
+
+VAKSMS_BASE = "https://vak-sms.com/backend"
+VAKSMS_RECAPTCHA_SITEKEY = "6LdfAV4qAAAAAKmrKRCHYNdNa2aNKl2FNxrqo_Og"
+_VAKSMS_TOKEN = None       # cached JWT
+_VAKSMS_EXPIRES = 0.0      # unix ts when it goes stale
+_VAKSMS_LAST_PRICE = None  # (tier price, ts) — refreshed hourly
+_VAKSMS_PRICE_TTL = 3600
+
+
+def _jwt_exp(token: str) -> float:
+    """exp claim from a JWT, 0.0 when the payload has no exp."""
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        return float(json.loads(base64.urlsafe_b64decode(payload))["exp"])
+    except Exception:
+        return 0.0
+
+
+async def _vaksms_signin() -> str:
+    """Solve the signin reCAPTCHA once, POST credentials, cache the JWT.
+
+    Raises on failure — callers treat an exception as 'this service is down'.
+    """
+    from core.captcha_solver import CaptchaSolver
+
+    captcha = await CaptchaSolver.solve_async(
+        VAKSMS_RECAPTCHA_SITEKEY, "https://vak-sms.com/signin"
+    )
+    if not captcha:
+        raise RuntimeError("vak-sms: could not solve signin reCAPTCHA")
+
+    payload = {
+        "username": Config.VAKSMS_EMAIL,
+        "password": Config.VAKSMS_PASSWORD,
+        "captcha": captcha,
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            f"{VAKSMS_BASE}/auth/signin", json=payload,
+            timeout=aiohttp.ClientTimeout(total=30),
+        ) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                raise RuntimeError(f"vak-sms signin failed ({resp.status}): {text[:200]}")
+            data = await resp.json()
+
+    token = data.get("accessToken") or ""
+    if not token:
+        raise RuntimeError(f"vak-sms signin returned no accessToken: {data}")
+    _set_vaksms_token(token)
+    logger.info("vak-sms: signed in, token cached")
+    return token
+
+
+def _set_vaksms_token(token: str):
+    global _VAKSMS_TOKEN, _VAKSMS_EXPIRES
+    exp = _jwt_exp(token)
+    # exp is the server's hard limit; keep a margin for clock drift.
+    _VAKSMS_EXPIRES = (exp - 60) if exp else (time.time() + 3600)
+    _VAKSMS_TOKEN = token
+
+
+async def _vaksms_token() -> str:
+    """A live JWT for this session, refreshing when the current one is stale."""
+    if _VAKSMS_TOKEN and time.time() < _VAKSMS_EXPIRES:
+        return _VAKSMS_TOKEN
+
+    if _VAKSMS_TOKEN:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{VAKSMS_BASE}/auth/refresh",
+                headers={"Authorization": f"Bearer {_VAKSMS_TOKEN}"},
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    token = data.get("accessToken") or ""
+                    if token:
+                        _set_vaksms_token(token)
+                        logger.info("vak-sms: token refreshed")
+                        return token
+                logger.warning(f"vak-sms refresh failed ({resp.status}); signing in fresh")
+
+    return await _vaksms_signin()
+
+
+async def _vaksms_headers() -> dict:
+    token = await _vaksms_token()
+    return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+
+async def _vaksms_best_price() -> float:
+    """Cheapest in-stock tier for the configured country+service.
+
+    The public /country/stats feed carries real stock per price tier, so the
+    adapter buys at the floor without ever guessing an operator — the backend
+    assigns one when operatorId is omitted.
+    """
+    global _VAKSMS_LAST_PRICE
+    now = time.time()
+    if _VAKSMS_LAST_PRICE and now < _VAKSMS_LAST_PRICE[1]:
+        return _VAKSMS_LAST_PRICE[0]
+
+    service = getattr(Config, "VAKSMS_SERVICE", "gl")
+    country = getattr(Config, "VAKSMS_COUNTRY", "ca")
+    ceiling = getattr(Config, "VAKSMS_MAX_PRICE", 0.15)
+
+    url = f"{VAKSMS_BASE}/country/stats"
+    params = {"serviceId": service}
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            url, params=params, timeout=aiohttp.ClientTimeout(total=15)
+        ) as resp:
+            if resp.status != 200:
+                raise RuntimeError(f"vak-sms price feed returned {resp.status}")
+            data = await resp.json()
+
+    best_price = None
+    for entry in data:
+        if entry.get("id") != country:
+            continue
+        for tier in entry.get("available", []):
+            if not tier.get("count"):
+                continue
+            price = tier.get("price")
+            if price is None or price > ceiling:
+                continue
+            if best_price is None or price < best_price:
+                best_price = price
+        break
+
+    if best_price is None:
+        raise RuntimeError(
+            f"vak-sms: no in-stock tier for country='{country}' service='{service}' "
+            f"under ${ceiling:.2f}"
+        )
+
+    _VAKSMS_LAST_PRICE = (best_price, now + _VAKSMS_PRICE_TTL)
+    logger.info(f"vak-sms: selected tier ${best_price:.4f} ({country}/{service})")
+    return best_price
+
+
+async def _get_vaksms_balance():
+    headers = await _vaksms_headers()
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            f"{VAKSMS_BASE}/user/current/me", headers=headers,
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as resp:
+            if resp.status != 200:
+                logger.warning(f"vak-sms balance check failed ({resp.status})")
+                return None
+            data = await resp.json()
+    balance = data.get("balance")
+    if balance is None:
+        return None
+    return float(balance)
+
+
+async def _get_vaksms_phone():
+    country = getattr(Config, "VAKSMS_COUNTRY", "ca")
+    service = getattr(Config, "VAKSMS_SERVICE", "gl")
+
+    try:
+        price = await _vaksms_best_price()
+    except Exception as e:
+        logger.error(f"vak-sms: {e}")
+        return None
+
+    payload = {
+        "countryCode": country,
+        "serviceCode": service,
+        "rentTime": 1200,           # 20 minutes, same as the site default
+        "price": price,
+        "apiKind": "SITE",
+    }
+    headers = await _vaksms_headers()
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            f"{VAKSMS_BASE}/number/buy", json=payload, headers=headers,
+            timeout=aiohttp.ClientTimeout(total=30),
+        ) as resp:
+            text = await resp.text()
+            if resp.status != 200:
+                logger.error(f"vak-sms buy failed ({resp.status}): {text[:200]}")
+                return None
+            try:
+                data = json.loads(text)
+            except json.JSONDecodeError:
+                logger.error(f"vak-sms buy: unparseable response: {text[:200]}")
+                return None
+
+    phone = data.get("tel") or data.get("phone") or ""
+    if not phone:
+        logger.error(f"vak-sms buy returned no number: {data}")
+        return None
+
+    # vak-sms keys every later call by phone number, so it IS the order id here.
+    return {"phone": phone, "id": phone}
+
+
+async def _vaksms_active_order(session, phone: str):
+    """The active-order record for `phone`, or None when it is gone."""
+    headers = await _vaksms_headers()
+    async with session.get(
+        f"{VAKSMS_BASE}/number/active",
+        params={"page": 1, "count": 50},
+        headers=headers,
+        timeout=aiohttp.ClientTimeout(total=15),
+    ) as resp:
+        if resp.status != 200:
+            logger.warning(f"vak-sms active list returned {resp.status}")
+            return None
+        data = await resp.json()
+
+    for item in (data.get("data") or []) if isinstance(data, dict) else []:
+        # telNumber is the canonical E.164 form the backend returns from /buy.
+        if str(item.get("telNumber") or "") == phone or str(item.get("tel") or "") == phone:
+            return item
+    return None
+
+
+async def _poll_vaksms_code(order_id: str, wait_time: int):
+    deadline = asyncio.get_running_loop().time() + wait_time
+    async with aiohttp.ClientSession() as session:
+        while asyncio.get_running_loop().time() < deadline:
+            try:
+                item = await _vaksms_active_order(session, order_id)
+                if not item:
+                    # Number vanished without a code — cancelled or expired.
+                    logger.warning(f"vak-sms: order {order_id} left the active list")
+                    return None
+                status = item.get("lastStatus")
+                if status == "SmsReceived" or item.get("smsCode"):
+                    raw = item.get("smsCode")
+                    code = _extract_code(str(raw)) if raw else None
+                    if code:
+                        logger.info(f"vak-sms code received: {code}")
+                        return code
+                    logger.warning(f"vak-sms: could not parse code from: {raw!r}")
+                    return None
+                if status in ("CancelledByTimeout", "CancelByUserSuccess", "CancelBannedSuccess"):
+                    logger.warning(f"vak-sms: order {order_id} cancelled (status={status})")
+                    return None
+            except Exception as e:
+                logger.warning(f"vak-sms poll error: {e}")
+            await asyncio.sleep(POLL_INTERVAL)
+
+    logger.warning("vak-sms: timed out waiting for code")
+    return None
+
+
+async def _cancel_vaksms_order(order_id: str):
+    # Phone numbers that already received a code cannot be refunded; only cancel
+    # orders still waiting, otherwise the API bills the number anyway.
+    payload = {
+        "phoneNumber": order_id,
+        "serviceCode": getattr(Config, "VAKSMS_SERVICE", "gl"),
+        "isBanned": False,
+    }
+    headers = await _vaksms_headers()
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            f"{VAKSMS_BASE}/number/cancel", json=payload, headers=headers,
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as resp:
+            if resp.status == 200:
+                logger.info(f"vak-sms order {order_id} cancelled")
+            else:
+                text = await resp.text()
+                logger.warning(f"vak-sms cancel failed ({resp.status}): {text[:160]}")
+
+
+async def _finish_vaksms_order(order_id: str):
+    # vak-sms has no explicit "finish" call; the number auto-closes when the
+    # rental window ends. Reporting success is enough — the next /number/active
+    # poll already reflects it. Kept as a no-op so the shared flow stays uniform.
+    logger.info(f"vak-sms order {order_id} marked complete by verification")
