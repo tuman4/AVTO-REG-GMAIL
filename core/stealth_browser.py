@@ -303,14 +303,17 @@ class PlaywrightStealthManager:
                     logger.info("%s script injected from js/%s", label, filename)
 
         # ── Session Warmup (builds trust cookies before signup) ─────────────
-        if Config.ENABLE_SESSION_WARMING and not is_premium:
+        # Premium runs need this too: a cold residential IP gets hit with the
+        # device "Send SMS" challenge, which no rental number can answer. The
+        # warmup is what makes the signup form's own phone field appear instead.
+        if Config.ENABLE_SESSION_WARMING:
             logger.info("Session warming enabled — running warmup engine...")
             try:
                 await WarmupEngine.run_warmup(self.page, duration_minutes=1)
             except Exception as wu_e:
                 logger.warning(f"Warmup failed (non-fatal): {wu_e}")
         else:
-            logger.info("Session warming disabled or Premium Mode active (skipping warmup).")
+            logger.info("Session warming disabled (skipping warmup).")
 
         logger.info(
             "Browser: Chromium/%s | %sx%s | locale=%s | masking=%s",

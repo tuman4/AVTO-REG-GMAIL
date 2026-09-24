@@ -863,7 +863,10 @@ async def _get_vaksms_phone():
             timeout=aiohttp.ClientTimeout(total=30),
         ) as resp:
             text = await resp.text()
-            if resp.status != 200:
+            # 201 Created is the success code for a fresh rental; accepting only
+            # 200 meant every real purchase logged a failure while the number
+            # was already billed.
+            if resp.status not in (200, 201):
                 logger.error(f"vak-sms buy failed ({resp.status}): {text[:200]}")
                 return None
             try:
@@ -878,7 +881,9 @@ async def _get_vaksms_phone():
         return None
 
     # vak-sms keys every later call by phone number, so it IS the order id here.
-    return {"phone": phone, "id": phone}
+    # purchaseId is kept for support/refund lookups.
+    return {"phone": phone, "id": phone,
+            "purchase_id": data.get("purchaseId") or data.get("purchase_id")}
 
 
 async def _vaksms_active_order(session, phone: str):

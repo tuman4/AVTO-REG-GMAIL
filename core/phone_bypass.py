@@ -805,9 +805,13 @@ async def handle_verification(page, is_mobile=False, use_sms_api=False, progress
         if progress and account_task:
             progress.update(account_task, description="[bold yellow]Phone verification — trying bypass...[/]")
 
+        # vak-sms authentic by email+password rather than an API key, so it is
+        # gated on its credentials instead. Leaving it out meant premium runs
+        # bought nothing and fell straight through to the bypass path.
         sms_available = use_sms_api and bool(
             Config.FIVESIM_API_KEY or Config.SMS_ACTIVATE_API_KEY or
-            Config.ONLINESIM_API_KEY or getattr(Config, 'GETSMS_API_KEY', '')
+            Config.ONLINESIM_API_KEY or getattr(Config, 'GETSMS_API_KEY', '') or
+            getattr(Config, 'VAKSMS_EMAIL', '') and getattr(Config, 'VAKSMS_PASSWORD', '')
         )
 
         success, method = await handle_phone_page(page, is_mobile, sms_available)
