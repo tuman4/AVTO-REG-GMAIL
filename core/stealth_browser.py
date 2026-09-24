@@ -7,6 +7,7 @@ from core.behavior import HumanBehavior
 from core.warmup import WarmupEngine
 from core.pw import async_playwright
 from core.proxy_manager import ProxyManager
+from core.pw import driver_name
 
 JS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "js")
 
@@ -61,6 +62,11 @@ class PlaywrightStealthManager:
             '--no-first-run',
             '--no-default-browser-check',
             '--window-position=0,0',
+            # WebRTC must not be allowed to discover the host network behind
+            # the proxy: the ICE candidate dump leaks the real public IP even
+            # when every other request goes through the tunnel.
+            '--force-webrtc-ip-handling-policy=disable_non_proxied_udp',
+            '--disable-webrtc-multiple-routes',
         ]
         if Config.BROWSER_NO_SANDBOX:
             launch_args.extend(['--no-sandbox', '--disable-setuid-sandbox'])
@@ -107,8 +113,13 @@ class PlaywrightStealthManager:
             {"width": 2560, "height": 1440, "aw": 2560, "ah": 1400},
         ]
         sp  = random.choice(screen_profiles)
-        hw  = random.choice([4, 6, 8, 12, 16])
-        mem = random.choice([4, 8, 16])
+        # Prefer the real hardware values over invented ones. patchright drops
+        # context init scripts entirely, so a fake hardwareConcurrency /
+        # deviceMemory injected from here would never apply anyway — and on
+        # drivers where it does apply, a deviceMemory that contradicts the
+        # Client Hints header is worse than the truth.
+        hw  = None
+        mem = None
 
         if is_premium:
             # Mobile emulation is explicit; keep its UA aligned with the
@@ -161,9 +172,28 @@ class PlaywrightStealthManager:
                 logger.warning(f"Failed to apply stealth plugin: {e}")
 
         # ── 12-point fingerprint spoofing (Clean & Dynamic) ────
+        # patchright drops context init scripts, so on that driver this whole
+        # block is inert — logged so an operator can tell the mask is not
+        # actually running rather than assuming it is.
+        if driver_name == "patchright":
+            logger.warning(
+                "Driver is patchright: context init scripts are dropped, so the "
+                "JS fingerprint mask will not apply. Reliance is on the patched "
+                "build's CDP silence plus context locale/timezone instead. "
+                "Set PLAYWRIGHT_DRIVER=playwright to enable the mask, but note "
+                "that driver cannot currently reach google.com through the proxy."
+            )
         rtt     = random.choice([25, 50, 100, 150])
         dnl     = round(random.uniform(10, 100), 1)
         bat     = round(random.uniform(0.75, 1.0), 2)
+        # 'en' is the language tag's script-less fallback; 'en-CA' + 'en' is
+        # what a Canadian Chrome actually reports.
+        browser_locale = Config.BROWSER_LOCALE
+        browser_lang = browser_locale.split("-")[0]
+        # Truthful hardware values: a spoof that contradicts the Client Hints
+        # header (or the real WebGL driver) scores worse than the truth.
+        hw  = None
+        mem = None
 
         webgl_vendors = ["Google Inc. (NVIDIA)", "Google Inc. (Intel)", "Google Inc. (AMD)"]
         webgl_renderers = [
@@ -175,6 +205,17 @@ class PlaywrightStealthManager:
         ]
         gl_vendor = random.choice(webgl_vendors)
         gl_renderer = random.choice(webgl_renderers)
+
+        # 'None' would render as literal JS and break every page load, so the
+        # hardware overrides are emitted only when a value was chosen.
+        hw_block = ""
+        if hw is not None and mem is not None:
+            hw_block = (
+                "Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => " + str(hw) + "});"
+                "Object.defineProperty(navigator, 'deviceMemory', {get: () => " + str(mem) + "});"
+            )
+        else:
+            hw_block = "// hardware values left native (see note above)"
 
         if Config.ENABLE_FINGERPRINT_MASKING:
             await self.context.add_init_script(f"""
@@ -196,13 +237,16 @@ class PlaywrightStealthManager:
                 }});
             }}
 
-            // 4. Languages
-            Object.defineProperty(navigator, 'languages', {{get: () => ['en-US', 'en']}});
-            Object.defineProperty(navigator, 'language', {{get: () => 'en-US'}});
+            // 4. Languages — must follow Config.BROWSER_LOCALE, not a hardcoded
+            // en-US. A locale that contradicts the Accept-Language header and
+            // the proxy's country is its own fraud signal.
+            Object.defineProperty(navigator, 'languages', {{get: () => ['{browser_locale}', '{browser_lang}']}});
+            Object.defineProperty(navigator, 'language', {{get: () => '{browser_locale}'}});
 
             // 5. Hardware concurrency & device memory
-            Object.defineProperty(navigator, 'hardwareConcurrency', {{get: () => {hw}}});
-            Object.defineProperty(navigator, 'deviceMemory', {{get: () => {mem}}});
+            // Only override when we deliberately picked a value; 'None' here
+            // would emit literal JS `None` and throw on every page load.
+            {hw_block}
 
             // 6. WebGL vendor/renderer spoof
             const origGetParameter = WebGLRenderingContext.prototype.getParameter;

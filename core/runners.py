@@ -372,6 +372,8 @@ async def async_playwright_flow(i, num_accounts, username, first_name, last_name
                                  use_sms_api=False, flow_mode="standard"):
     _update_progress(progress, account_task, completed=5, description="Starting Playwright Stealth flow...")
     manager = PlaywrightStealthManager()
+    # Mutable holder so the nested-restart path below can increment it.
+    escape_count = [0]
 
     try:
         # ── Initialize browser ────────────────────────────────────────────
@@ -382,12 +384,10 @@ async def async_playwright_flow(i, num_accounts, username, first_name, last_name
         page = manager.page
         is_mobile = getattr(manager, 'is_mobile', False)
 
-        # ── Pre-Warming ──────────────────────────────────────────────────
-        if not use_sms_api:
-            _update_progress(progress, account_task, completed=10, description="Building Google trust session...")
-            await _google_prewarm(page)
-        else:
-            _update_progress(progress, account_task, completed=10, description="Premium Mode: Direct to Registration...")
+        # No second prewarm here. manager.initialize() already ran the warmup
+        # engine in this same context; doing it again doubles the visible
+        # Google-service bouncing without adding trust, and each extra hop is
+        # another behavioural anomaly to score.
 
         # ── Step 1: Navigate to Google Signup ────────────────────────────
         _update_progress(progress, account_task, completed=15,
@@ -653,19 +653,21 @@ async def async_playwright_flow(i, num_accounts, username, first_name, last_name
         for attempt in range(max_username_retries):
             username_field = await find_username_field()
             if not username_field:
-                await page.evaluate("""(u) => {
-                    const sels = ['input[name="Username"]','input[name="username"]',
-                                  'input[autocomplete="username"]','input[type="text"]'];
-                    for (const s of sels) {
-                        const el = document.querySelector(s);
-                        if (el && el.offsetParent !== null) {
-                            el.focus(); el.value = u;
-                            el.dispatchEvent(new Event('input',{bubbles:true}));
-                            el.dispatchEvent(new Event('change',{bubbles:true}));
-                            break;
-                        }
-                    }
-                }""", current_username)
+                # Fall back to the element locator but type through it. The old
+                # path set .value and dispatched synthetic events, which carry
+                # isTrusted=false — Botguard reads that as machine input.
+                for sel in ('input[name="Username"]', 'input[name="username"]',
+                            'input[autocomplete="username"]', 'input[type="text"]'):
+                    try:
+                        fallback = await page.query_selector(sel)
+                        if fallback and await fallback.is_visible():
+                            await fallback.click()
+                            await page.wait_for_timeout(200)
+                            await fallback.fill(current_username)
+                            username_field = fallback
+                            break
+                    except Exception:
+                        continue
             else:
                 await username_field.scroll_into_view_if_needed()
                 await username_field.click()
@@ -744,6 +746,17 @@ async def async_playwright_flow(i, num_accounts, username, first_name, last_name
         )
 
         if should_restart:
+            escape_count[0] += 1
+            if escape_count[0] > 1:
+                # Escaping once is luck, twice is the session being flagged.
+                # Restarting again only escalates Google's suspicion and
+                # poisons the signup URLs for the next account too.
+                logger.warning(
+                    f"Verification escaped {escape_count[0]}x — session is "
+                    f"flagged; stopping instead of hammering Google again"
+                )
+                return False, CreationError.IP_FLAGGED
+
             # Escaped verification — need to restart the entire signup flow
             logger.info(f"Verification escaped ({method}) — restarting signup flow...")
             _update_progress(progress, account_task, completed=25,
