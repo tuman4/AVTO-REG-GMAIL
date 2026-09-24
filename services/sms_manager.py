@@ -720,7 +720,8 @@ async def _vaksms_signin() -> str:
             f"{VAKSMS_BASE}/auth/signin", json=payload,
             timeout=aiohttp.ClientTimeout(total=30),
         ) as resp:
-            if resp.status != 200:
+            # NestJS returns 201 Created on a fresh session; treat 200/201 alike.
+            if resp.status not in (200, 201):
                 text = await resp.text()
                 raise RuntimeError(f"vak-sms signin failed ({resp.status}): {text[:200]}")
             data = await resp.json()
