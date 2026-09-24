@@ -113,11 +113,6 @@ class Config:
     TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
     TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-    # ── Voice OTP server (optional) ─────────────────────────────────────
-    # REQUIRED for /voice and /otp — an empty token means the server refuses
-    # to start rather than exposing an unauthenticated endpoint.
-    VOICE_SERVER_TOKEN = os.getenv("VOICE_SERVER_TOKEN", "")
-
     @classmethod
     def validate(cls) -> list[str]:
         """Surface insecure or unusable configuration at startup.
@@ -126,12 +121,6 @@ class Config:
         are the operator's call; our job is to make sure they are deliberate.
         """
         warnings = []
-
-        if not cls.VOICE_SERVER_TOKEN:
-            warnings.append(
-                "VOICE_SERVER_TOKEN is not set in .env — the voice OTP server "
-                "will refuse to start. Set a strong secret token."
-            )
 
         if cls.YOUR_PASSWORD:
             warnings.append(
