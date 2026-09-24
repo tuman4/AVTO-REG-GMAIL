@@ -18,10 +18,11 @@ logs a loud warning at every write rather than silently storing secrets —
 """
 import os
 import logging
+from config.settings import PROJECT_ROOT
 
 logger = logging.getLogger('gmail_creator_vault')
 
-_VAULT_KEY_PATH = os.path.join("data", ".vault.key")
+_VAULT_KEY_PATH = os.path.join(PROJECT_ROOT, "data", ".vault.key")
 
 try:
     from cryptography.fernet import Fernet, InvalidToken

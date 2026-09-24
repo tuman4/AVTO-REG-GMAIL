@@ -33,6 +33,7 @@ from core.trust_builder import (
     warm_up_session, ghost_mode_prepare,
 )
 from core.account_manager import account_manager
+from core.proxy_manager import ProxyManager
 
 logger = logging.getLogger('gmail_creator_selenium')
 
@@ -136,32 +137,15 @@ def validate_birthday(birthday_str):
 
 def _parse_proxy(proxy_string):
     """Parse proxy string into components: host:port or user:pass@host:port."""
-    try:
-        proxy_string = proxy_string.strip()
-        if not proxy_string:
-            return None
-
-        if "@" in proxy_string:
-            auth, hostport = proxy_string.rsplit("@", 1)
-            user, passwd = auth.split(":", 1)
-            host, port = hostport.rsplit(":", 1)
-            return {"host": host, "port": port, "user": user, "pass": passwd}
-        else:
-            parts = proxy_string.rsplit(":", 1)
-            if len(parts) == 2:
-                return {"host": parts[0], "port": parts[1], "user": None, "pass": None}
-    except Exception:
-        pass
-    return None
+    return ProxyManager.parse(proxy_string)
 
 
-def _install_proxy_auth_extension(chrome_options, parsed):
+def _install_proxy_auth_extension(chrome_options, parsed, profile_dir):
     """Inject proxy credentials via a packed extension (Selenium can't pass auth
     through --proxy-server, and dropping it leaks the real IP)."""
     try:
-        import zipfile
-
-        ext_dir = tempfile.mkdtemp(prefix="proxyauth_")
+        ext_dir = os.path.join(profile_dir, "proxy_auth_extension")
+        os.makedirs(ext_dir, exist_ok=True)
         manifest = json.dumps({
             "version": "1.0.0",
             "manifest_version": 2,
@@ -171,13 +155,14 @@ def _install_proxy_auth_extension(chrome_options, parsed):
                             "webRequestBlocking"],
             "background": {"scripts": ["background.js"]},
         }, indent=2)
+        import json as _json
         background = (
             "var config = {\n"
             f"  mode: 'fixed_servers',\n"
             "  rules: {\n"
             "    singleProxy: {\n"
-            f"      scheme: 'http',\n"
-            f"      host: '{parsed['host']}',\n"
+            f"      scheme: {_json.dumps(parsed.get('scheme', 'http'))},\n"
+            f"      host: {_json.dumps(parsed['host'])},\n"
             f"      port: {int(parsed['port'])}\n"
             "    },\n"
             "    bypassList: ['localhost']\n"
@@ -187,8 +172,8 @@ def _install_proxy_auth_extension(chrome_options, parsed):
             "  function() {});\n"
             "function callbackFn(details) {\n"
             "  return {\n"
-            f"    authCredentials: {{username: '{parsed['user']}',\n"
-            f"      password: '{parsed['pass'] or ''}'}}\n"
+            f"    authCredentials: {{username: {_json.dumps(parsed['user'])},\n"
+            f"      password: {_json.dumps(parsed['pass'] or '')}}}\n"
             "  };\n"
             "}\n"
             "chrome.webRequest.onAuthRequired.addListener(\n"
@@ -200,12 +185,9 @@ def _install_proxy_auth_extension(chrome_options, parsed):
         with open(os.path.join(ext_dir, "background.js"), "w", encoding="utf-8") as f:
             f.write(background)
 
-        ext_path = os.path.join(ext_dir, "proxy_auth.zip")
-        with zipfile.ZipFile(ext_path, "w", zipfile.ZIP_DEFLATED) as z:
-            z.write(os.path.join(ext_dir, "manifest.json"), "manifest.json")
-            z.write(os.path.join(ext_dir, "background.js"), "background.js")
-
-        chrome_options.add_argument(f"--load-extension={ext_path}")
+        # Chrome expects an unpacked directory here; passing a zip path makes
+        # the option look accepted while silently disabling authentication.
+        chrome_options.add_argument(f"--load-extension={ext_dir}")
     except Exception as e:
         logger.error(f"Failed to build proxy-auth extension: {e}")
 
@@ -226,17 +208,14 @@ def create_driver(proxy=None):
 
         width, height = random.choice(SCREEN_SIZES)
         chrome_options.add_argument(f'--window-size={width},{height}')
-        # Chrome only treats --/-prefixed args as switches; a bare user-agent=...
-        # was parsed as a URL to open, so UA rotation never applied AND a junk
-        # navigation fired at startup.
-        chrome_options.add_argument(f'--user-agent={random.choice(USER_AGENTS)}')
+        # Let Chrome advertise its real build. A stale UA plus current Client
+        # Hints is internally inconsistent and causes flaky signup pages.
 
         chrome_options.add_experimental_option('excludeSwitches', ['enable-automation', 'enable-logging'])
         chrome_options.add_experimental_option('useAutomationExtension', False)
         chrome_options.add_argument('--disable-blink-features=AutomationControlled')
         chrome_options.add_argument("--disable-webrtc")
         chrome_options.add_argument("--force-webrtc-ip-handling-policy=disable_non_proxied_udp")
-        chrome_options.add_argument('--no-sandbox')
         chrome_options.add_argument('--disable-dev-shm-usage')
         chrome_options.add_argument('--disable-gpu')
         chrome_options.add_argument('--disable-infobars')
@@ -244,13 +223,13 @@ def create_driver(proxy=None):
         chrome_options.add_argument('--disable-software-rasterizer')
         chrome_options.add_argument('--disable-logging')
         chrome_options.add_argument('--log-level=3')
-        chrome_options.add_argument('--ignore-certificate-errors')
-        chrome_options.add_argument('--ignore-ssl-errors')
         chrome_options.add_argument('--no-experiments')
         chrome_options.add_argument('--no-default-browser-check')
         chrome_options.add_argument('--no-first-run')
-        chrome_options.add_argument('--disable-extensions')
         chrome_options.add_argument('--disable-popup-blocking')
+
+        if Config.BROWSER_NO_SANDBOX:
+            chrome_options.add_argument('--no-sandbox')
 
         if Config.HEADLESS_MODE:
             chrome_options.add_argument('--headless=new')
@@ -261,15 +240,21 @@ def create_driver(proxy=None):
         if proxy:
             parsed = _parse_proxy(proxy)
             if not parsed:
-                logger.warning(f"Proxy {proxy!r} could not be parsed — running without a proxy")
-            elif parsed["user"]:
+                raise ValueError(f"Proxy {proxy!r} could not be parsed")
+            proxy_scheme = parsed.get("scheme", "http")
+            host = f"[{parsed['host']}]" if ":" in parsed["host"] else parsed["host"]
+            chrome_options.add_argument(
+                f"--proxy-server={proxy_scheme}://{host}:{parsed['port']}"
+            )
+            if parsed["user"]:
                 # --proxy-server cannot carry credentials, so authenticated proxies
                 # need the classic manifest-based extension or they are silently
                 # dropped and traffic exits from the real IP.
-                _install_proxy_auth_extension(chrome_options, parsed)
+                if proxy_scheme not in ("http", "https"):
+                    raise ValueError("Selenium authenticated proxies support only http/https")
+                _install_proxy_auth_extension(chrome_options, parsed, profile_dir)
                 logger.info(f"Using authenticated proxy: {parsed['host']}:{parsed['port']}")
             else:
-                chrome_options.add_argument(f'--proxy-server={parsed["host"]}:{parsed["port"]}')
                 logger.info(f"Using proxy: {parsed['host']}:{parsed['port']}")
 
         service = _get_chrome_service()
@@ -561,11 +546,21 @@ def create_account_selenium(driver, wait, username, password, birthday_str, gend
             return False, "QR_BLOCKED"
 
         email = f"{username}@gmail.com"
-        account_manager.save(
+
+        # A Google page naming our exact address is the only real proof of
+        # creation; URL heuristics match on pages a stranger can visit.
+        if not _confirm_signed_in_as_selenium(driver, email):
+            logger.warning(f"Could not verify {email} — account may not have been created")
+            return False, "VERIFICATION_FAILED"
+
+        saved = account_manager.save(
             email=email, password=password,
             first_name=first_name, last_name=last_name,
             strategy=f"selenium_{mode}",
         )
+        if not saved:
+            logger.error(f"Account NOT persisted: {email} — DB rejected the row")
+            return False, "DB_SAVE_FAILED"
         logger.info(f"Account created: {email}")
         return True, None
 
@@ -573,6 +568,44 @@ def create_account_selenium(driver, wait, username, password, birthday_str, gend
         logger.error(f"Selenium account creation error: {e}")
         return False, "UNKNOWN_ERROR"
 
+
+def _confirm_signed_in_as_selenium(driver, expected_email, timeout=15):
+    """Prove the session is signed in as exactly `expected_email`.
+
+    Landing on a Google URL proves nothing on its own — those pages render for
+    anonymous visitors. Only the exact address counts.
+    """
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+    from selenium.webdriver.common.by import By
+    import re
+
+    expected = expected_email.strip().lower()
+    deadline = time.time() + timeout
+    for url in ("https://myaccount.google.com/?hl=en",
+                "https://accounts.google.com/AccountChooser?hl=en"):
+        try:
+            driver.get(url)
+            WebDriverWait(driver, timeout).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+            time.sleep(1.5)
+        except Exception:
+            continue
+        if time.time() > deadline:
+            break
+        try:
+            text = (driver.execute_script("return document.body ? document.body.innerText : '';") or "")
+            attrs = driver.execute_script(
+                "const out=[]; document.querySelectorAll('[data-email],[aria-label],[title]')"
+                ".forEach(e=>{['data-email','aria-label','title'].forEach(a=>{const v=e.getAttribute(a); if(v) out.push(v);});}); return out;"
+            ) or []
+            blob = text.lower() + " " + " ".join(str(a).lower() for a in attrs)
+            found = set(m.lower() for m in re.findall(r"[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}", blob))
+            if expected in found:
+                logger.info(f"Verified signed in as {expected_email} via {url}")
+                return True
+        except Exception as probe_err:
+            logger.debug(f"verification probe failed on {url}: {probe_err}")
+    return False
 
 def _select_create_own(driver):
     """Try to click 'Create your own Gmail address' option."""

@@ -44,7 +44,7 @@ if sys.platform == 'win32':
 from rich.panel import Panel
 from rich.prompt import Prompt
 
-from config.settings import Config
+from config.settings import Config, PROJECT_ROOT
 from core.ui import (
     console, THEME, show_banner, show_menu, get_menu_choice,
     ask_num_accounts, ask_warmup_minutes, get_progress_context,
@@ -53,6 +53,7 @@ from core.ui import (
 )
 from core.account_manager import account_manager
 from core.database import DatabaseManager
+from core.passwords import generate_password
 from core.proxy_manager import proxy_manager
 from core.retry_engine import retry_engine
 
@@ -81,8 +82,30 @@ def run_startup_validation():
     print_validation_report(console, THEME)
 
 
+from core.retry_engine import retry_engine, CreationError
+
+# run_playwright_flow records the outcome into retry_engine but returns only a
+# bool. The batch loop needs the error class itself to decide whether the proxy
+# deserves the blame, so we read back the last recorded error for the flow.
+_last_playwright_error = {}
+
+
+class _ErrorSniffer:
+    """Wrap retry_engine.record_attempt and remember the most recent error."""
+
+    def __init__(self, real):
+        self._real = real
+
+    def __call__(self, strategy, success, error_type=None):
+        if not success:
+            _last_playwright_error[strategy] = error_type or CreationError.UNKNOWN
+        return self._real(strategy, success, error_type)
+
+
+retry_engine.record_attempt = _ErrorSniffer(retry_engine.record_attempt)
+
 def _generate_username():
-    from core.selenium_runner import generate_name
+    from core.passwords import generate_name
     name = generate_name()
     parts = name.split()
     first = parts[0].lower() if parts else "user"
@@ -90,7 +113,8 @@ def _generate_username():
     return f"{first}{last}{random.randint(1000, 9999)}", parts
 
 
-def run_creation_flow(num_accounts, warmup_minutes=10, flow_mode='standard', use_sms_api=False):
+def run_creation_flow(num_accounts, warmup_minutes=10, flow_mode='standard',
+                 use_sms_api=False, prior_results=None):
     """
     Unified account creation flow. Routes to Playwright, Appium, or Selenium
     based on Config.ENGINE_MODE.
@@ -100,7 +124,7 @@ def run_creation_flow(num_accounts, warmup_minutes=10, flow_mode='standard', use
 
     if not password:
         try:
-            with open("config/password.txt", "r", encoding="utf-8") as f:
+            with open(os.path.join(PROJECT_ROOT, "config", "password.txt"), "r", encoding="utf-8") as f:
                 password = f.read().strip()
         except FileNotFoundError:
             pass
@@ -109,6 +133,13 @@ def run_creation_flow(num_accounts, warmup_minutes=10, flow_mode='standard', use
 
     successes = 0
     failures = 0
+    error_counts = {}
+    # A resumed session inherits its earlier tally so the summary covers the
+    # whole job, not just the shard picked up after the interrupt.
+    if prior_results:
+        successes = int(prior_results.get("successes", 0))
+        failures = int(prior_results.get("failures", 0))
+        error_counts = dict(prior_results.get("error_counts", {}))
     start_time = time.time()
 
     with get_progress_context() as progress:
@@ -121,7 +152,6 @@ def run_creation_flow(num_accounts, warmup_minutes=10, flow_mode='standard', use
             last_name = name_parts[-1] if len(name_parts) > 1 else "User"
 
             if use_generated_passwords:
-                from core.selenium_runner import generate_password
                 password = generate_password()
 
             progress.update(current, completed=5,
@@ -130,65 +160,93 @@ def run_creation_flow(num_accounts, warmup_minutes=10, flow_mode='standard', use
             proxy = proxy_manager.get_best() or proxy_manager.get_next()
 
             success = False
-            max_retries = 2 if proxy_manager.count > 1 else 1
+            last_error = None
+            attempt = 0
+            max_retries = retry_engine.MAX_RETRIES if proxy_manager.count > 1 else 1
 
-            for attempt in range(max_retries):
+            while True:
                 if attempt > 0:
-                    # Retry with a different proxy
-                    old_proxy = proxy
-                    if old_proxy:
+                    # Only errors that implicate the egress IP cost the proxy
+                    # its life. A form/validation glitch is not the proxy's
+                    # fault, and killing a good residential IP for a browser
+                    # crash burns the whole pool for nothing.
+                    if old_proxy and retry_engine.should_change_proxy(last_error):
                         proxy_manager.mark_failure(old_proxy, fatal=True)
-                    proxy = proxy_manager.get_next()
-                    if proxy == old_proxy:
-                        proxy = proxy_manager.get_random()
-                    username, name_parts = _generate_username()
-                    first_name = name_parts[0] if name_parts else "User"
-                    last_name = name_parts[-1] if len(name_parts) > 1 else "User"
-                    if use_generated_passwords:
-                        password = generate_password()
-                    print_warning(f"Retrying with {'new proxy' if proxy else 'no proxy'} (attempt {attempt+1})...")
+                        proxy = proxy_manager.get_next()
+                        if proxy == old_proxy:
+                            proxy = proxy_manager.get_random()
+                    # A taken username is not reusable; everything else retries
+                    # with a fresh identity to avoid colliding with Google's
+                    # cache of the failed attempt.
+                    if last_error != CreationError.USERNAME_TAKEN:
+                        username, name_parts = _generate_username()
+                        first_name = name_parts[0] if name_parts else "User"
+                        last_name = name_parts[-1] if len(name_parts) > 1 else "User"
+                        if use_generated_passwords:
+                            password = generate_password()
                     progress.update(current, completed=5,
-                                    description=f"[{THEME['warning']}]Retry {attempt+1} — Account {i+1}...[/]")
-                    time.sleep(random.randint(5, 15))
+                                    description=f"[{THEME['warning']}]Retry {attempt} — Account {i+1}...[/]")
+                    time.sleep(retry_engine.get_cooldown(attempt - 1, last_error))
 
+                old_proxy = proxy
                 try:
                     if engine == 'playwright':
                         from core.runners import run_playwright_flow
-                        success = run_playwright_flow(
+                        result = run_playwright_flow(
                             i, num_accounts, username, first_name, last_name,
                             password, progress, current, proxy,
                             use_sms_api=use_sms_api, flow_mode=flow_mode,
                         )
+                        error_type = _last_playwright_error.get(flow_mode)
                     elif engine == 'appium':
                         from core.runners import run_appium_flow
                         month, day, year = Config.YOUR_BIRTHDAY.split() if Config.YOUR_BIRTHDAY else ("1", "1", "1990")
-                        success = run_appium_flow(
+                        result = run_appium_flow(
                             i, num_accounts, username, first_name, last_name,
                             password, month, day, year, str(Config.YOUR_GENDER),
                             progress, current,
                         )
+                        error_type = None
                     else:
                         from core.selenium_runner import run_selenium_flow
-                        success = run_selenium_flow(
+                        result = run_selenium_flow(
                             i, num_accounts, username, password,
                             warmup_minutes=warmup_minutes,
                             stealth_mode=(not use_sms_api),
                             mode=flow_mode, proxy=proxy,
                         )
+                        error_type = None
+                    success = bool(result)
+                    if not success and error_type is None:
+                        error_type = CreationError.UNKNOWN
+                    last_error = error_type
                 except Exception as e:
                     print_error(f"Account {i+1} error: {e}")
+                    success = False
+                    last_error = CreationError.BROWSER_CRASH
 
                 if success:
+                    break
+                attempt += 1
+                if not retry_engine.should_retry(last_error, attempt) or attempt >= max_retries:
                     break
 
             if success:
                 successes += 1
+                retry_engine.record_attempt(flow_mode, True)
+                error_counts[CreationError.USERNAME_TAKEN] = error_counts.get(CreationError.USERNAME_TAKEN, 0)
                 print_success(f"Account {i+1}/{num_accounts}: {username}@gmail.com CREATED")
                 if proxy:
                     proxy_manager.mark_success(proxy)
             else:
                 failures += 1
-                print_error(f"Account {i+1}/{num_accounts}: {username}@gmail.com FAILED")
+                retry_engine.record_attempt(flow_mode, False, last_error)
+                error_counts[last_error or CreationError.UNKNOWN] = (
+                    error_counts.get(last_error or CreationError.UNKNOWN, 0) + 1
+                )
+                print_error(f"Account {i+1}/{num_accounts}: {username}@gmail.com FAILED ({last_error or 'unknown'})")
+                # A failure the proxy did not cause still marks it suspect:
+                # mark_failure() only downweights, it does not blacklist.
                 if proxy:
                     proxy_manager.mark_failure(proxy)
 
@@ -203,7 +261,8 @@ def run_creation_flow(num_accounts, warmup_minutes=10, flow_mode='standard', use
                     batch_config={"num_accounts": num_accounts, "flow_mode": flow_mode,
                                   "use_sms_api": use_sms_api, "warmup_minutes": warmup_minutes},
                     completed_indices=completed_indices,
-                    results={"successes": successes, "failures": failures},
+                    results={"successes": successes, "failures": failures,
+                             "error_counts": error_counts},
                 )
             except Exception:
                 pass
@@ -218,7 +277,7 @@ def run_creation_flow(num_accounts, warmup_minutes=10, flow_mode='standard', use
     db = DatabaseManager()
     db.save_session_stats(
         total_attempts=num_accounts, successes=successes, failures=failures,
-        strategies_used={flow_mode: num_accounts}, errors={},
+        strategies_used={flow_mode: num_accounts}, errors=error_counts,
         duration_seconds=duration,
     )
 
@@ -269,7 +328,7 @@ def handle_export(choice, accounts):
 def main():
     setup_logging()
 
-    os.makedirs("data", exist_ok=True)
+    os.makedirs(os.path.join(PROJECT_ROOT, "data"), exist_ok=True)
 
     run_startup_validation()
 
@@ -444,11 +503,14 @@ def main():
                         confirm = Prompt.ask(f"[{THEME['primary']}]Resume this session?[/]",
                                              choices=["y", "n"], default="y")
                         if confirm == "y":
+                            # Replay the prior tally so the resumed batch
+                            # reports on the whole job, not just this shard.
                             run_creation_flow(
                                 len(remaining),
                                 warmup_minutes=cfg.get("warmup_minutes", 5),
                                 flow_mode=cfg.get("flow_mode", "standard"),
                                 use_sms_api=cfg.get("use_sms_api", False),
+                                prior_results=prev,
                             )
                         else:
                             clear_confirm = Prompt.ask(

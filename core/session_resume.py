@@ -4,6 +4,7 @@ Session Resume - Save and restore interrupted batch creation sessions
 import os
 import json
 import logging
+import tempfile
 from datetime import datetime
 
 logger = logging.getLogger('gmail_creator_session')
@@ -23,9 +24,22 @@ class SessionManager:
             "completed_indices": completed_indices,
             "results": results,
         }
+        # Write-then-rename so an interrupted flush cannot truncate the only
+        # copy: the destination is either the previous good state or the new
+        # whole one, never a half-written file.
         os.makedirs(os.path.dirname(self.filepath), exist_ok=True)
-        with open(self.filepath, "w", encoding="utf-8") as f:
-            json.dump(state, f, indent=2, ensure_ascii=False)
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=".session_", suffix=".tmp",
+            dir=os.path.dirname(self.filepath),
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(state, f, indent=2, ensure_ascii=False)
+            os.replace(tmp_path, self.filepath)
+        except Exception:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            raise
         logger.info(f"Session saved: {len(completed_indices)} completed")
 
     def load_state(self):

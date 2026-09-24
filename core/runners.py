@@ -32,6 +32,73 @@ def _update_progress(progress, task, **kwargs):
         progress.update(task, **kwargs)
 
 
+# Collect every email address a Google page exposes: visible text plus the
+# profile/account elements that carry the signed-in address in data attributes.
+_EMAILS_ON_PAGE_JS = r"""
+() => {
+  const out = new Set();
+  const re = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g;
+  const scan = (s) => { if (!s) return; (s.match(re) || []).forEach(m => out.add(m.toLowerCase())); };
+  scan(document.body ? document.body.innerText : '');
+  document.querySelectorAll('[data-email],[data-identifier],[aria-label],[title]').forEach(el => {
+    scan(el.getAttribute('data-email'));
+    scan(el.getAttribute('data-identifier'));
+    scan(el.getAttribute('aria-label'));
+    scan(el.getAttribute('title'));
+  });
+  return [...out];
+}
+"""
+
+# myaccount renders the currently signed-in address in the profile chip, so an
+# exact match proves we hold the session for the account we just built.
+_VERIFICATION_PROBES = [
+    ("https://myaccount.google.com/?hl=en", "myaccount"),
+    ("https://accounts.google.com/AccountChooser?hl=en", "chooser"),
+]
+
+
+async def _confirm_signed_in_as(page, expected_email, timeout=15000):
+    """Prove the session is signed in as exactly `expected_email`.
+
+    Landing on youtube.com or seeing "inbox" proves nothing — those pages render
+    for any anonymous visitor. Only an exact address match counts.
+    """
+    expected = expected_email.strip().lower()
+    for url, label in _VERIFICATION_PROBES:
+        try:
+            await page.goto(url, timeout=timeout, wait_until="domcontentloaded")
+            await page.wait_for_timeout(1500)
+            found = await page.evaluate(_EMAILS_ON_PAGE_JS)
+            if expected in [addr.lower() for addr in found]:
+                logger.info(f"Verified signed in as {expected_email} via {label}")
+                return label
+        except Exception as probe_err:
+            logger.debug(f"{label} verification probe failed: {probe_err}")
+    return None
+
+
+_WEAK_URL_SIGNALS = (
+    "myaccount.google.com", "mail.google.com", "workspace.google.com", "gds.google.com",
+)
+
+
+def _weak_verification_signal(url, content):
+    """Circumstantial fallback, used only when Google was unreachable.
+
+    A Google URL plus a post-signup phrase suggests success but never proves the
+    exact account exists — it stays a low-confidence note on the DB row.
+    """
+    low_url = (url or "").lower()
+    low_content = (content or "").lower()
+    if not any(s in low_url for s in _WEAK_URL_SIGNALS):
+        return None
+    for phrase in ("welcome to google", "your google account is ready", "your new account"):
+        if phrase in low_content:
+            return phrase
+    return None
+
+
 def run_appium_flow(i, num_accounts, username, first_name, last_name, password,
                     month, day, year, gender, progress, account_task):
     if AppiumManager is None:
@@ -854,49 +921,32 @@ async def async_playwright_flow(i, num_accounts, username, first_name, last_name
         _update_progress(progress, account_task, completed=95, description="Verifying account creation...")
 
         account_verified = False
+        verification_note = ""
+
+        # The only real proof: Google must name our exact address as the
+        # signed-in account. youtube.com/"inbox" heuristics matched on pages
+        # an anonymous visitor can reach, so they counted failures as
+        # creations.
         try:
-            current_url = page.url.lower()
-            verified_urls = [
-                "myaccount.google.com", "mail.google.com",
-                "accounts.google.com/signin/continue",
-                "youtube.com", "workspace.google.com",
-                "gds.google.com",
-            ]
-            if any(v in current_url for v in verified_urls):
+            probe = await _confirm_signed_in_as(page, f"{username}@gmail.com")
+            if probe:
                 account_verified = True
-                logger.info(f"Account verified via URL: {current_url}")
-
-            if not account_verified:
-                content = await page.content()
-                content_lower = content.lower()
-                verified_signals = [
-                    "welcome to google", "مرحبًا بك في google",
-                    "your new account", "حسابك الجديد",
-                    "your google account is ready", "حسابك في google جاهز",
-                    "inbox", "primary", "promotions",
-                    "search mail", "compose",
-                ]
-                if any(s in content_lower for s in verified_signals):
-                    account_verified = True
-                    logger.info("Account verified via page content signals")
-
-            if not account_verified:
-                try:
-                    await page.goto("https://myaccount.google.com/", timeout=15000, wait_until="domcontentloaded")
-                    await page.wait_for_timeout(3000)
-                    my_url = page.url.lower()
-                    my_content = await page.content()
-                    if "myaccount.google.com" in my_url and "sign in" not in my_content.lower():
-                        account_verified = True
-                        logger.info("Account verified via myaccount.google.com navigation")
-                except Exception:
-                    pass
-
         except Exception as verify_err:
-            logger.debug(f"Verification check error (non-fatal): {verify_err}")
+            logger.debug(f"Verification probe error (non-fatal): {verify_err}")
 
         if not account_verified:
-            logger.warning("Could not verify account creation — account may not have been created")
+            # Circumstantial signals stay a note, never a success verdict:
+            # they only mean we landed somewhere Google-owned.
+            try:
+                weak = _weak_verification_signal(page.url, await page.content())
+                if weak:
+                    verification_note = f"weak signal only ({weak}); no exact-email confirmation"
+                    logger.warning(f"{username}@gmail.com: {verification_note}")
+            except Exception:
+                pass
+
+        if not account_verified:
+            logger.warning(f"Could not verify {username}@gmail.com — account may not have been created")
             _update_progress(progress, account_task, completed=100,
                             description="[bold yellow]Unverified — account may not exist[/]")
             return False, CreationError.UNKNOWN
@@ -906,10 +956,12 @@ async def async_playwright_flow(i, num_accounts, username, first_name, last_name
                         description=f"[bold green]SUCCESS: {username}@gmail.com[/]")
         logger.info(f"Account VERIFIED and created: {username}@gmail.com")
 
-        # Save to database
+        # Save to database. A row that never landed is not a created account:
+        # reporting CREATED anyway hands over credentials that exist nowhere.
+        from core.account_manager import account_manager
+        saved = False
         try:
-            from core.account_manager import account_manager
-            account_manager.save(
+            saved = account_manager.save(
                 email=f"{username}@gmail.com",
                 password=password,
                 first_name=first_name,
@@ -919,9 +971,15 @@ async def async_playwright_flow(i, num_accounts, username, first_name, last_name
                 sms_service=method if "sms" in method else "",
                 birthday=f"{month}/{day}/{year}",
                 gender=gender,
+                notes=verification_note,
             )
         except Exception as db_err:
-            logger.error(f"Failed to save account: {db_err}")
+            logger.error(f"Failed to save account {username}@gmail.com: {db_err}")
+        if not saved:
+            logger.error(f"Account NOT persisted: {username}@gmail.com — DB rejected the row")
+            _update_progress(progress, account_task, completed=100,
+                            description=f"[bold red]CREATED BUT NOT SAVED: {username}@gmail.com[/]")
+            return False, CreationError.UNKNOWN
 
         # Print credentials to console
         from core.ui import print_success

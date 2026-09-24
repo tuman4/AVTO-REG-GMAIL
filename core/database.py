@@ -14,13 +14,14 @@ import json
 from contextlib import closing
 
 from core.secure_vault import vault
+from config.settings import PROJECT_ROOT
 
 logger = logging.getLogger('gmail_creator_db')
 
 
 class DatabaseManager:
-    def __init__(self, db_path="data/database.db"):
-        self.db_path = db_path
+    def __init__(self, db_path=None):
+        self.db_path = db_path or os.path.join(PROJECT_ROOT, "data", "database.db")
         self._ensure_dir()
         self._init_db()
         self._migrate_schema()

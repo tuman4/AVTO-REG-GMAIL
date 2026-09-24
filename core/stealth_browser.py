@@ -6,6 +6,7 @@ from config.settings import Config
 from core.behavior import HumanBehavior
 from core.warmup import WarmupEngine
 from core.pw import async_playwright
+from core.proxy_manager import ProxyManager
 
 JS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "js")
 
@@ -37,16 +38,21 @@ class PlaywrightStealthManager:
 
     async def initialize(self, proxy=None, is_premium=False):
         logger.info("Initializing Playwright Stealth Browser...")
+
+        # Validate before starting the Playwright subprocess. This makes bad
+        # proxy input fail deterministically even when the local browser
+        # runtime itself cannot spawn a child process.
+        proxy_settings = ProxyManager.format_for_playwright(proxy) if proxy else None
+        if proxy and not proxy_settings:
+            raise ValueError("Invalid proxy format; browser launch aborted")
+
         self.playwright = await async_playwright().start()
         
         launch_args = [
             '--disable-blink-features=AutomationControlled',
             '--disable-features=IsolateOrigins,site-per-process,AutomationControlled',
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
             '--disable-infobars',
             '--disable-dev-shm-usage',
-            '--disable-background-networking=false',
             '--disable-breakpad',
             '--disable-component-update',
             '--disable-domain-reliability',
@@ -54,29 +60,21 @@ class PlaywrightStealthManager:
             '--metrics-recording-only',
             '--no-first-run',
             '--no-default-browser-check',
-            '--lang=en-US',
             '--window-position=0,0',
         ]
+        if Config.BROWSER_NO_SANDBOX:
+            launch_args.extend(['--no-sandbox', '--disable-setuid-sandbox'])
         
-        # Setup proxy formatting if provided
-        proxy_settings = None
-        if proxy:
-            parts = proxy.split(':')
-            if len(parts) == 4:
-                # Format: host:port:user:pass
-                proxy_settings = {
-                    "server": f"http://{parts[0]}:{parts[1]}",
-                    "username": parts[2],
-                    "password": parts[3]
-                }
-                logger.info(f"Proxy configured: {parts[0]}:{parts[1]} (authenticated)")
-            elif len(parts) == 2:
-                # Format: host:port
-                proxy_settings = {"server": f"http://{parts[0]}:{parts[1]}"}
-                logger.info(f"Proxy configured: {parts[0]}:{parts[1]}")
-            else:
-                logger.error(f"Invalid proxy format '{proxy}'. Expected 'host:port' or 'host:port:user:pass'. Proxy disabled.")
-                proxy_settings = None
+        # A malformed proxy must fail closed. Silently continuing without it
+        # leaks the host IP and makes the resulting session impossible to trust.
+        if proxy_settings:
+            parsed_proxy = ProxyManager.parse(proxy)
+            logger.info(
+                "Proxy configured: %s:%s%s",
+                parsed_proxy["host"],
+                parsed_proxy["port"],
+                " (authenticated)" if parsed_proxy["user"] else "",
+            )
                 
         # Launch real chrome/chromium — try installed Chrome first, fall back to bundled Chromium
         try:
@@ -96,13 +94,10 @@ class PlaywrightStealthManager:
         
 
         # ── Fingerprint profile (randomized per session) ───────────────────────
-        chrome_versions = [
-            "134.0.6998.117", "134.0.6998.89",  "133.0.6943.141",
-            "133.0.6943.126", "132.0.6834.160", "132.0.6834.110",
-            "131.0.6778.264", "131.0.6778.205",
-        ]
-        chrome_ver   = random.choice(chrome_versions)
-        chrome_major = chrome_ver.split(".")[0]
+        # Use the actual browser build. A random historical UA combined with
+        # current Chromium Client Hints is internally inconsistent and causes
+        # both flaky rendering and unnecessary security challenges.
+        chrome_ver = self.browser.version
 
         screen_profiles = [
             {"width": 1920, "height": 1080, "aw": 1920, "ah": 1040},
@@ -115,58 +110,44 @@ class PlaywrightStealthManager:
         hw  = random.choice([4, 6, 8, 12, 16])
         mem = random.choice([4, 8, 16])
 
-        geo_profiles = [
-            {"tz": "America/New_York",    "lon": -74.006,   "lat": 40.7128},
-            {"tz": "America/Chicago",     "lon": -87.6298,  "lat": 41.8781},
-            {"tz": "America/Los_Angeles", "lon": -118.2437, "lat": 34.0522},
-            {"tz": "Europe/London",       "lon": -0.1276,   "lat": 51.5074},
-            {"tz": "Europe/Berlin",       "lon": 13.4050,   "lat": 52.5200},
-        ]
-        geo = random.choice(geo_profiles)
-
         if is_premium:
-            # Mobile emulation forces SMS verification instead of QR (no QR scanning on mobile devices natively)
+            # Mobile emulation is explicit; keep its UA aligned with the
+            # actual Chromium build instead of inventing an older version.
             ua = f"Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{chrome_ver} Mobile Safari/537.36"
             viewport = {"width": 412, "height": 915}
             is_mobile = True
             has_touch = True
-            sec_ch_ua_mobile = "?1"
-            sec_ch_ua_platform = '"Android"'
         else:
-            ua = (
-                f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                f"AppleWebKit/537.36 (KHTML, like Gecko) "
-                f"Chrome/{chrome_ver} Safari/537.36"
-            )
             viewport = {"width": sp["width"], "height": sp["height"]}
             is_mobile = False
             has_touch = False
-            sec_ch_ua_mobile = "?0"
-            sec_ch_ua_platform = '"Windows"'
 
-        self.context = await self.browser.new_context(
-            viewport=viewport,
-            user_agent=ua,
-            locale="en-US",
-            timezone_id=geo["tz"],
-            has_touch=has_touch,
-            is_mobile=is_mobile,
-            geolocation={"longitude": geo["lon"], "latitude": geo["lat"]},
-            permissions=["geolocation"],
-            color_scheme="light",
-            extra_http_headers={
-                "Accept-Language": "en-US,en;q=0.9",
-                "Accept-Encoding": "gzip, deflate, br, zstd",
-                "sec-ch-ua": f'"Google Chrome";v="{chrome_major}", "Chromium";v="{chrome_major}", "Not_A Brand";v="24"',
-                "sec-ch-ua-mobile": sec_ch_ua_mobile,
-                "sec-ch-ua-platform": sec_ch_ua_platform,
-                "sec-fetch-dest": "document",
-                "sec-fetch-mode": "navigate",
-                "sec-fetch-site": "none",
-                "sec-fetch-user": "?1",
-                "Upgrade-Insecure-Requests": "1",
-            }
-        )
+        context_options = {
+            "viewport": viewport,
+            "locale": Config.BROWSER_LOCALE,
+            "has_touch": has_touch,
+            "is_mobile": is_mobile,
+            "color_scheme": "light",
+        }
+        if is_premium:
+            context_options["user_agent"] = ua
+
+        timezone = getattr(Config, "BROWSER_TIMEZONE", "")
+        if timezone:
+            context_options["timezone_id"] = timezone
+
+        geolocation = getattr(Config, "BROWSER_GEOLOCATION", "")
+        if geolocation:
+            try:
+                latitude, longitude = (float(value.strip()) for value in geolocation.split(",", 1))
+                context_options["geolocation"] = {"latitude": latitude, "longitude": longitude}
+                context_options["permissions"] = ["geolocation"]
+            except (TypeError, ValueError):
+                raise ValueError("BROWSER_GEOLOCATION must be `latitude,longitude`")
+
+        self.context = await self.browser.new_context(**context_options)
+        self.context.set_default_timeout(Config.BROWSER_TIMEOUT * 1000)
+        self.context.set_default_navigation_timeout(Config.BROWSER_TIMEOUT * 1000)
 
         self.is_mobile = is_mobile
         self.page = await self.context.new_page()
@@ -195,7 +176,8 @@ class PlaywrightStealthManager:
         gl_vendor = random.choice(webgl_vendors)
         gl_renderer = random.choice(webgl_renderers)
 
-        await self.page.add_init_script(f"""
+        if Config.ENABLE_FINGERPRINT_MASKING:
+            await self.context.add_init_script(f"""
         (() => {{
             // 1. Remove webdriver flag
             try {{ delete navigator.__proto__.webdriver; }} catch(_) {{}}
@@ -229,6 +211,7 @@ class PlaywrightStealthManager:
                 if (param === 37446) return '{gl_renderer}';
                 return origGetParameter.call(this, param);
             }};
+            if (typeof WebGL2RenderingContext === 'undefined') return;
             const origGetParameter2 = WebGL2RenderingContext.prototype.getParameter;
             WebGL2RenderingContext.prototype.getParameter = function(param) {{
                 if (param === 37445) return '{gl_vendor}';
@@ -305,7 +288,19 @@ class PlaywrightStealthManager:
                 return origToDataURL.apply(this, arguments);
             }};
         }})();
-        """)
+            """)
+
+        # Optional scripts must be registered before the first navigation so
+        # warmup and signup observe the same page state.
+        for enabled, filename, label in (
+            (Config.ENABLE_POLTERGEIST, "poltergeist_fp.js", "Poltergeist FP"),
+            (Config.ENABLE_GHOST_TYPER, "ghost_typer.js", "Ghost Typer"),
+        ):
+            if enabled:
+                script = _load_js_file(filename)
+                if script:
+                    await self.context.add_init_script(script)
+                    logger.info("%s script injected from js/%s", label, filename)
 
         # ── Session Warmup (builds trust cookies before signup) ─────────────
         if Config.ENABLE_SESSION_WARMING and not is_premium:
@@ -317,21 +312,14 @@ class PlaywrightStealthManager:
         else:
             logger.info("Session warming disabled or Premium Mode active (skipping warmup).")
 
-        # ── Inject Poltergeist fingerprint script from JS file ─────────────
-        if Config.ENABLE_POLTERGEIST:
-            poltergeist_js = _load_js_file("poltergeist_fp.js")
-            if poltergeist_js:
-                await self.page.add_init_script(poltergeist_js)
-                logger.info("Poltergeist FP script injected from js/poltergeist_fp.js")
-
-        # ── Inject Ghost Typer behavioral script from JS file ──────────────
-        if Config.ENABLE_GHOST_TYPER:
-            ghost_js = _load_js_file("ghost_typer.js")
-            if ghost_js:
-                await self.page.add_init_script(ghost_js)
-                logger.info("Ghost Typer script injected from js/ghost_typer.js")
-
-        logger.info(f"FP: Chrome/{chrome_ver} | {sp['width']}x{sp['height']} | {geo['tz']} | {hw}c/{mem}GB")
+        logger.info(
+            "Browser: Chromium/%s | %sx%s | locale=%s | masking=%s",
+            chrome_ver,
+            sp["width"],
+            sp["height"],
+            Config.BROWSER_LOCALE,
+            Config.ENABLE_FINGERPRINT_MASKING,
+        )
         return True
 
 
@@ -356,6 +344,11 @@ class PlaywrightStealthManager:
                 await self.playwright.stop()
         except Exception:
             pass
+        finally:
+            self.page = None
+            self.context = None
+            self.browser = None
+            self.playwright = None
             
     async def natural_type(self, selector, text):
         try:

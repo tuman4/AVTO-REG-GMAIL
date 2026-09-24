@@ -7,6 +7,7 @@ import json
 import logging
 from datetime import datetime
 from core.database import DatabaseManager
+from config.settings import PROJECT_ROOT
 
 logger = logging.getLogger('gmail_creator_accounts')
 
@@ -46,12 +47,36 @@ class AccountManager:
             if svc:
                 sms_services[svc] = sms_services.get(svc, 0) + 1
 
+        # The DB only ever stores successes — a failed registration leaves no
+        # row, so active/total was 100% by construction. The true conversion
+        # rate comes from the recorded sessions, which count both outcomes.
+        attempts = successes = 0
+        recent_errors = {}
+        for session in self.db.get_session_history(limit=50):
+            try:
+                attempts += int(session.get("total_attempts") or 0)
+                successes += int(session.get("successes") or 0)
+            except (TypeError, ValueError):
+                continue
+            try:
+                errors = json.loads(session.get("errors") or "{}")
+                for error_type, count in errors.items():
+                    recent_errors[error_type] = recent_errors.get(error_type, 0) + int(count)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                continue
+
         return {
             "total": total,
             "active": active,
-            "success_rate": (active / total * 100) if total > 0 else 0,
+            # Share of batches that produced an account. Falls back to the
+            # accounts table only when no session was ever recorded.
+            "success_rate": (successes / attempts * 100) if attempts else (
+                (active / total * 100) if total else 0.0
+            ),
             "strategies": strategies,
             "sms_services": sms_services,
+            "attempts": attempts,
+            "error_breakdown": recent_errors,
         }
 
     def _ensure_dir(self, filepath):
@@ -67,7 +92,7 @@ class AccountManager:
 
     def export_csv(self, filepath=None):
         if not filepath:
-            filepath = f"data/accounts_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            filepath = os.path.join(PROJECT_ROOT, "data", f"accounts_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
         accounts = self.db.get_all_accounts()
         self._ensure_dir(filepath)
         with open(filepath, "w", newline="", encoding="utf-8") as f:
@@ -87,7 +112,7 @@ class AccountManager:
 
     def export_json(self, filepath=None):
         if not filepath:
-            filepath = f"data/accounts_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            filepath = os.path.join(PROJECT_ROOT, "data", f"accounts_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
         accounts = self.db.get_all_accounts()
         self._ensure_dir(filepath)
         with open(filepath, "w", encoding="utf-8") as f:
@@ -97,7 +122,7 @@ class AccountManager:
 
     def export_txt(self, filepath=None):
         if not filepath:
-            filepath = f"data/accounts_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+            filepath = os.path.join(PROJECT_ROOT, "data", f"accounts_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
         accounts = self.db.get_all_accounts()
         self._ensure_dir(filepath)
         with open(filepath, "w", encoding="utf-8") as f:
@@ -110,7 +135,7 @@ class AccountManager:
         migrated = 0
 
         # Migrate accounts.txt
-        txt_path = "data/accounts.txt"
+        txt_path = os.path.join(PROJECT_ROOT, "data", "accounts.txt")
         if os.path.exists(txt_path):
             try:
                 with open(txt_path, "r", encoding="utf-8") as f:
@@ -127,7 +152,7 @@ class AccountManager:
                 logger.error(f"TXT migration failed: {e}")
 
         # Migrate accounts.json
-        json_path = "data/accounts.json"
+        json_path = os.path.join(PROJECT_ROOT, "data", "accounts.json")
         if os.path.exists(json_path):
             try:
                 with open(json_path, "r", encoding="utf-8") as f:

@@ -41,8 +41,15 @@ class AccountHealthChecker:
         except imaplib.IMAP4.error as e:
             err = str(e).lower()
             if "invalid" in err or "credentials" in err:
-                result["status"] = "password_changed"
-                result["message"] = "Invalid credentials — password may have been changed"
+                # Plain-password IMAP is unreliable for Gmail: the same account
+                # with a working password is rejected without an app password /
+                # OAuth, so this does NOT prove the password was changed.
+                result["status"] = "auth_failed"
+                result["message"] = (
+                    "IMAP rejected the password — note that Gmail requires an app "
+                    "password or OAuth for plain IMAP login, so this is not proof "
+                    "that the password was changed"
+                )
             elif "web login" in err or "less secure" in err:
                 result["status"] = "locked"
                 result["message"] = "Account requires web login — may be locked"

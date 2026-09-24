@@ -12,7 +12,7 @@ def validate_config():
     Validate all configuration settings on startup.
     Returns: (warnings: list[str], errors: list[str])
     """
-    from config.settings import Config
+    from config.settings import Config, PROJECT_ROOT
 
     warnings = []
     errors = []
@@ -20,7 +20,7 @@ def validate_config():
     # Password — empty is valid (a unique per-account password is generated),
     # so this is informational, not an error.
     if not Config.YOUR_PASSWORD:
-        pw_file = "config/password.txt"
+        pw_file = os.path.join(PROJECT_ROOT, "config", "password.txt")
         has_pw_file = False
         if os.path.exists(pw_file):
             try:
@@ -149,7 +149,7 @@ def validate_config():
             warnings.append(f"Names file has only {len(names)} names — add more for variety")
 
     # Data directory
-    if not os.path.exists("data"):
+    if not os.path.exists(os.path.join(PROJECT_ROOT, "data")):
         warnings.append("data/ directory missing — will be created automatically")
 
     # Telegram notification

@@ -11,7 +11,8 @@ import os
 
 from dotenv import load_dotenv
 
-load_dotenv()
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+load_dotenv(os.path.join(PROJECT_ROOT, ".env"))
 
 logger = logging.getLogger("gmail_creator_config")
 
@@ -27,6 +28,12 @@ def _int(name: str, default: int) -> int:
         return int(os.getenv(name, str(default)))
     except (TypeError, ValueError):
         return default
+
+
+def _project_path(name: str, default: str) -> str:
+    """Resolve project-owned paths independently of the caller's cwd."""
+    value = os.getenv(name, default).strip()
+    return value if os.path.isabs(value) else os.path.join(PROJECT_ROOT, value)
 
 
 class Config:
@@ -77,7 +84,7 @@ class Config:
 
     # ── Proxy ───────────────────────────────────────────────────────────
     ENABLE_PROXY = _flag("ENABLE_PROXY")
-    PROXY_FILE = os.getenv("PROXY_FILE", "config/proxies.txt")
+    PROXY_FILE = _project_path("PROXY_FILE", "config/proxies.txt")
 
     # Mobile proxies rotate the egress IP on demand; point this at the
     # provider's rotation URL to get a fresh IP per account.
@@ -88,8 +95,15 @@ class Config:
     # playwright = primary. appium = Android "golden method". selenium = legacy.
     ENGINE_MODE = os.getenv("ENGINE_MODE", "playwright").lower()
     HEADLESS_MODE = _flag("HEADLESS_MODE")
-    BROWSER_TIMEOUT = _int("BROWSER_TIMEOUT", 30)
+    BROWSER_TIMEOUT = max(1, _int("BROWSER_TIMEOUT", 30))
     PLAYWRIGHT_DRIVER = os.getenv("PLAYWRIGHT_DRIVER", "patchright").lower()
+    BROWSER_LOCALE = os.getenv("BROWSER_LOCALE", "en-CA").strip() or "en-CA"
+    # An empty value falls back to the host timezone, which contradicts the
+    # egress IP. Default to Canada so a bare-config run still looks coherent.
+    BROWSER_TIMEZONE = os.getenv("BROWSER_TIMEZONE", "America/Toronto").strip()
+    # Optional `latitude,longitude`; empty means do not grant geolocation access.
+    BROWSER_GEOLOCATION = os.getenv("BROWSER_GEOLOCATION", "").strip()
+    BROWSER_NO_SANDBOX = _flag("BROWSER_NO_SANDBOX")
 
     # ── Anti-detection & behaviour ──────────────────────────────────────
     ENABLE_SESSION_WARMING = _flag("ENABLE_SESSION_WARMING", "True")
@@ -104,8 +118,8 @@ class Config:
     ENABLE_GHOST_TYPER = _flag("ENABLE_GHOST_TYPER")
 
     # ── Data paths ──────────────────────────────────────────────────────
-    NAMES_FILE = os.getenv("NAMES_FILE", "data/names.txt")
-    LOG_FILE = os.getenv("LOG_FILE", "data/gmail_creator.log")
+    NAMES_FILE = _project_path("NAMES_FILE", "data/names.txt")
+    LOG_FILE = _project_path("LOG_FILE", "data/gmail_creator.log")
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
     ENABLE_LOGGING = _flag("ENABLE_LOGGING", "True")
 

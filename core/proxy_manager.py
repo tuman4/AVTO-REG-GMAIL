@@ -7,6 +7,7 @@ import random
 import logging
 import threading
 import requests
+from urllib.parse import quote, unquote, urlsplit
 from config.settings import Config
 
 logger = logging.getLogger('gmail_creator_proxy')
@@ -50,46 +51,22 @@ class ProxyManager:
 
     @staticmethod
     def normalize(line: str):
-        """Accept every documented format and return a canonical host:port:user:pass string."""
-        line = line.strip()
-        if not line:
-            return None
-        scheme = ""
-        low = line.lower()
-        for s in _SUPPORTED_SCHEMES:
-            if low.startswith(s):
-                scheme = s
-                line = line[len(s):]
-                break
-
-        user = pwd = None
-        if "@" in line:
-            auth, line = line.rsplit("@", 1)
-            if ":" in auth:
-                user, pwd = auth.split(":", 1)
-            else:
-                user = auth
-
-        # host:port[:user:pass] — colon-separated remainder
-        parts = line.split(":")
-        if len(parts) == 2:
-            host, port = parts
-        elif len(parts) == 4 and user is None:
-            host, port, user, pwd = parts
-        else:
+        """Accept documented formats without losing scheme or IPv6 brackets."""
+        parsed = ProxyManager.parse(line)
+        if not parsed:
             return None
 
-        if not host or not port.isdigit() or not (1 <= int(port) <= 65535):
-            return None
-
-        if scheme.startswith("socks") and not requests_builtins_support_socks():
+        if parsed["scheme"].startswith("socks") and not requests_builtins_support_socks():
             logger.warning(
-                f"SOCKS proxy {host}:{port} requires PySocks (pip install pysocks) — loaded but untested"
+                f"SOCKS proxy {parsed['host']}:{parsed['port']} requires PySocks"
             )
 
-        canonical = f"{host}:{port}"
-        if user:
-            canonical += f":{user}:{pwd or ''}"
+        host = parsed["host"]
+        host_for_url = f"[{host}]" if ":" in host else host
+        prefix = "" if parsed["scheme"] == "http" else f"{parsed['scheme']}://"
+        canonical = f"{prefix}{host_for_url}:{parsed['port']}"
+        if parsed["user"]:
+            canonical += f":{parsed['user']}:{parsed['pass'] or ''}"
         return canonical
 
     @property
@@ -159,17 +136,16 @@ class ProxyManager:
         if not parsed:
             return False
         try:
-            proxies_dict = {}
-            if parsed["user"]:
-                proxy_url = f"http://{parsed['user']}:{parsed['pass']}@{parsed['host']}:{parsed['port']}"
-            else:
-                proxy_url = f"http://{parsed['host']}:{parsed['port']}"
+            proxy_url = self._proxy_url(parsed)
             proxies_dict = {"http": proxy_url, "https": proxy_url}
             resp = requests.get(_HEALTH_URL, proxies=proxies_dict, timeout=timeout)
-            if resp.status_code == 200:
-                with self._lock:
-                    self._health[proxy] = True
-                return True
+            try:
+                if resp.status_code == 200:
+                    with self._lock:
+                        self._health[proxy] = True
+                    return True
+            finally:
+                resp.close()
         except Exception as e:
             logger.debug(f"Proxy health check failed for {self._mask(proxy)}: {e}")
         with self._lock:
@@ -189,21 +165,39 @@ class ProxyManager:
         parsed = self.parse(proxy)
         if not parsed:
             return None
-        if parsed["user"]:
-            url = f"http://{parsed['user']}:{parsed['pass']}@{parsed['host']}:{parsed['port']}"
-        else:
-            url = f"http://{parsed['host']}:{parsed['port']}"
+        url = self._proxy_url(parsed)
         return {"http": url, "https": url}
+
+    @staticmethod
+    def _proxy_url(parsed):
+        host = f"[{parsed['host']}]" if ":" in parsed["host"] else parsed["host"]
+        auth = ""
+        if parsed["user"] is not None:
+            auth = quote(parsed["user"], safe="")
+            if parsed["pass"] is not None:
+                auth += ":" + quote(parsed["pass"], safe="")
+            auth += "@"
+        return f"{parsed['scheme']}://{auth}{host}:{parsed['port']}"
 
     def get_ip_info(self, proxy=None):
         try:
             proxies_dict = self._requests_proxies(proxy) if proxy else {}
 
             ip_resp = requests.get("https://api.ipify.org?format=json", proxies=proxies_dict, timeout=10)
-            ip = ip_resp.json().get("ip", "Unknown")
+            try:
+                ip = ip_resp.json().get("ip", "Unknown")
+            finally:
+                ip_resp.close()
 
-            info_resp = requests.get(f"https://ipinfo.io/{ip}/json", timeout=10)
-            info = info_resp.json()
+            info_resp = requests.get(
+                f"https://ipinfo.io/{ip}/json",
+                proxies=proxies_dict,
+                timeout=10,
+            )
+            try:
+                info = info_resp.json()
+            finally:
+                info_resp.close()
 
             is_datacenter = "hosting" in str(info.get("org", "")).lower()
             return {
@@ -239,52 +233,49 @@ class ProxyManager:
         if not proxy_string:
             return None
         s = str(proxy_string).strip()
-        # strip an optional scheme so the canonical string stays the single source of truth
-        for sch in _SUPPORTED_SCHEMES:
-            if s.lower().startswith(sch):
-                s = s[len(sch):]
+        scheme = "http"
+        for supported in _SUPPORTED_SCHEMES:
+            if s.lower().startswith(supported):
+                scheme = supported[:-3]
+                s = s[len(supported):]
                 break
-
-        user = pwd = None
-        if "@" in s:
-            auth, s = s.rsplit("@", 1)
-            if ":" in auth:
-                user, pwd = auth.split(":", 1)
-            else:
-                user = auth
-
-        # IPv6 literal: [::1]:8080
-        if s.startswith("["):
-            end = s.find("]")
-            if end == -1:
-                return None
-            host = s[1:end]
-            rest = s[end + 1:]
         else:
-            head, _, rest = s.partition(":")
-            host = head
-
-        port = None
-        if rest.startswith(":"):
-            rest = rest[1:]
-        if rest:
-            port, _, leftover = rest.partition(":")
-            if not port.isdigit():
+            if "://" in s:
                 return None
-            if leftover and user is None:
-                user, _, pwd = leftover.partition(":")
 
-        if not host or not port:
+        # Legacy host:port:user:pass is still accepted, including when the
+        # host is not an IPv6 literal.
+        if "@" not in s and not s.startswith("[") and s.count(":") == 3:
+            host, port, user, pwd = s.split(":", 3)
+            candidate = f"{scheme}://{quote(user, safe='')}:{quote(pwd, safe='')}@{host}:{port}"
+        else:
+            candidate = f"{scheme}://{s}"
+
+        try:
+            parsed = urlsplit(candidate)
+            host = parsed.hostname
+            port = parsed.port
+        except ValueError:
             return None
 
-        return {"host": host, "port": str(port), "user": user, "pass": pwd}
+        if not host or port is None or not (1 <= port <= 65535):
+            return None
+
+        return {
+            "scheme": scheme,
+            "host": unquote(host),
+            "port": str(port),
+            "user": unquote(parsed.username) if parsed.username is not None else None,
+            "pass": unquote(parsed.password) if parsed.password is not None else None,
+        }
 
     @staticmethod
     def format_for_playwright(proxy_string):
         parsed = ProxyManager.parse(proxy_string)
         if not parsed:
             return None
-        result = {"server": f"http://{parsed['host']}:{parsed['port']}"}
+        host = f"[{parsed['host']}]" if ":" in parsed["host"] else parsed["host"]
+        result = {"server": f"{parsed['scheme']}://{host}:{parsed['port']}"}
         if parsed["user"]:
             result["username"] = parsed["user"]
             result["password"] = parsed["pass"] or ""
@@ -295,9 +286,10 @@ class ProxyManager:
         parsed = ProxyManager.parse(proxy_string)
         if not parsed:
             return None
+        host = f"[{parsed['host']}]" if ":" in parsed["host"] else parsed["host"]
         if parsed["user"]:
-            return f"{proxy_type}://{parsed['user']}:{parsed['pass']}@{parsed['host']}:{parsed['port']}"
-        return f"{parsed['host']}:{parsed['port']}"
+            return f"{proxy_type}://{parsed['user']}:{parsed['pass'] or ''}@{host}:{parsed['port']}"
+        return f"{host}:{parsed['port']}"
 
     def maybe_recover_blacklisted(self):
         """Give blacklisted proxies a second chance when nothing healthy is left."""
@@ -327,6 +319,7 @@ class ProxyManager:
 
 def requests_builtins_support_socks():
     try:
+        import socks  # noqa: F401
         return True
     except ImportError:
         return False
