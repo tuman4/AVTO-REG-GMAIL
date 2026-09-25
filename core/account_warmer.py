@@ -43,6 +43,38 @@ async def warm_existing_session(page, duration_minutes=5):
     logger.info(f"Warming existing session for {duration_minutes} minutes...")
     end = time.time() + duration_minutes * 60
 
+    # Same guard as WarmupEngine: this warmer plays a YouTube video for 25-60s,
+    # which alone streams more bytes than the entire signup. Trust comes from
+    # the logged-in page views, not from buffering video.
+    heavy_types = ("image/", "video/", "audio/", "font/")
+    heavy_hosts = (
+        "googlevideo.com", "ytimg.com", "ggpht.com", "googleusercontent.com",
+    )
+
+    async def _block_heavy(route):
+        req = route.request
+        restype = req.resource_type or ""
+        url = req.url or ""
+        if restype in ("image", "media", "font", "preload"):
+            await route.abort()
+            return
+        if restype in ("xhr", "fetch") and any(h in url for h in heavy_hosts):
+            await route.abort()
+            return
+        content_type = (req.headers or {}).get("content-type", "").lower()
+        if any(t in content_type for t in heavy_types):
+            await route.abort()
+            return
+        if any(h in url for h in heavy_hosts):
+            await route.abort()
+            return
+        await route.continue_()
+
+    try:
+        await page.route("**/*", _block_heavy)
+    except Exception as block_err:
+        logger.debug(f"warmer: heavy-asset blocking unavailable: {block_err}")
+
     async def _dwell(lo, hi):
         await page.wait_for_timeout(random.randint(lo * 1000, hi * 1000))
 
@@ -130,6 +162,12 @@ async def warm_existing_session(page, duration_minutes=5):
             await activity()
         except Exception as e:
             logger.debug(f"warmer/activity: {e}")
+
+    # Stop blocking assets so a later flow in this context is not starved.
+    try:
+        await page.unroute("**/*")
+    except Exception:
+        pass
 
     logger.info("Session warming complete")
     return True

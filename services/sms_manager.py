@@ -951,7 +951,7 @@ async def _cancel_vaksms_order(order_id: str):
             f"{VAKSMS_BASE}/number/cancel", json=payload, headers=headers,
             timeout=aiohttp.ClientTimeout(total=15),
         ) as resp:
-            if resp.status == 200:
+            if resp.status in (200, 201):
                 logger.info(f"vak-sms order {order_id} cancelled")
             else:
                 text = await resp.text()

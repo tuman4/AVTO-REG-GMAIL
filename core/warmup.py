@@ -11,14 +11,11 @@ class WarmupEngine:
 
     GOOGLE_SITES = [
         "https://www.google.com",
-        "https://www.youtube.com",
         "https://news.google.com",
-        "https://maps.google.com",
         "https://play.google.com",
         "https://store.google.com",
         "https://translate.google.com",
         "https://scholar.google.com",
-        "https://photos.google.com",
         "https://drive.google.com",
     ]
 
@@ -37,6 +34,45 @@ class WarmupEngine:
         logger.info(f"Starting Google trust warmup for {duration_minutes} minutes...")
 
         end_time = time.time() + (duration_minutes * 60)
+
+        # Block the heavy asset classes during warmup. Google sets its trust
+        # cookies on the document/script requests themselves; the thumbnails,
+        # video segments and map tiles are ~95% of the egress bytes for zero
+        # added trust. A warmup that loads video pulls tens of MB per account
+        # through a metered proxy.
+        heavy_types = (
+            "image/", "video/", "audio/",
+            "font/", "application/font", "application/x-font",
+        )
+        heavy_hosts = (
+            "googlevideo.com", "ytimg.com", "ggpht.com", "googleusercontent.com",
+            "googleapis.com", "gstatic.com",
+        )
+
+        async def _block_heavy(route):
+            req = route.request
+            restype = req.resource_type or ""
+            url = req.url or ""
+            if restype in ("image", "media", "font", "preload"):
+                await route.abort()
+                return
+            if restype in ("xhr", "fetch") and any(h in url for h in heavy_hosts):
+                await route.abort()
+                return
+            content_type = (req.headers or {}).get("content-type", "").lower()
+            if any(t in content_type for t in heavy_types):
+                await route.abort()
+                return
+            if any(h in url for h in ("googlevideo.com", "ytimg.com")):
+                await route.abort()
+                return
+            await route.continue_()
+
+        try:
+            await page.route("**/*", _block_heavy)
+        except Exception as block_err:
+            logger.debug(f"warmup: heavy-asset blocking unavailable: {block_err}")
+
 
         async def _accept_cookies():
             for sel in [
@@ -131,6 +167,10 @@ class WarmupEngine:
                 # `continue` spins at 100% CPU until the whole duration elapses.
                 await asyncio.sleep(5)
 
+        try:
+            await page.unroute("**/*")
+        except Exception:
+            pass
         try:
             await page.goto("https://accounts.google.com", timeout=15000, wait_until="domcontentloaded")
             await page.wait_for_timeout(random.randint(1500, 2500))
